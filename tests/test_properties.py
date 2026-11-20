@@ -14,41 +14,48 @@ from hypothesis import strategies as st
 from authz import service
 from authz.models import ClearingRequest, ReversalRequest
 
-LIMIT, PER_TXN, MONTHLY = 30_000, 20_000, 50_000
+# Two cards share one credit line, so either a card limit or the company limit can bind.
+LIMIT, PER_TXN, MONTHLY = 60_000, 20_000, 40_000
+CARDS = ("card_a", "card_b")
 
 
 @dataclass
 class Auth:
     ntid: str
+    card: str
     held: int
     cleared: int = 0
     status: str = "pending"
 
 
-@settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(st.data())
 def test_random_lifecycle_matches_reference_model(data: st.DataObject) -> None:
     truncate()  # fixtures run per test, not per Hypothesis example
     insert_company(credit_limit=LIMIT)
-    insert_card(per_txn_limit=PER_TXN, monthly_limit=MONTHLY, blocked_mccs=())
+    for card in CARDS:
+        insert_card(card, per_txn_limit=PER_TXN, monthly_limit=MONTHLY, blocked_mccs=())
     model: list[Auth] = []
 
-    for step in range(data.draw(st.integers(1, 12), label="steps")):
+    for step in range(data.draw(st.integers(1, 15), label="steps")):
         pending = [a for a in model if a.status == "pending"]
         op = data.draw(st.sampled_from(["auth", "auth", "reverse", "clear"]), label="op")
 
         if op == "auth" or not pending:
+            card = data.draw(st.sampled_from(CARDS), label="card")
             used = sum(a.held + a.cleared for a in model)
+            card_used = sum(a.held + a.cleared for a in model if a.card == card)
             # Bias towards exact limits (and +1): random ints alone rarely hit a boundary.
-            edges = [
-                e for b in (PER_TXN, MONTHLY - used, LIMIT - used) for e in (b, b + 1) if e > 0
-            ]
+            limits = (PER_TXN, MONTHLY - card_used, LIMIT - used)
+            edges = [e for b in limits for e in (b, b + 1) if e > 0]
             amount = data.draw(st.integers(1, 25_000) | st.sampled_from(edges), label="amount")
-            expected = amount <= PER_TXN and used + amount <= MONTHLY and amount <= LIMIT - used
-            res = service.authorize(auth_request(f"ntx_{step}", amount=amount))
-            assert (res["decision"] == "approved") is expected, (amount, used, res)
+            expected = (
+                amount <= PER_TXN and card_used + amount <= MONTHLY and amount <= LIMIT - used
+            )
+            res = service.authorize(auth_request(f"ntx_{step}", card_id=card, amount=amount))
+            assert (res["decision"] == "approved") is expected, (amount, card_used, used, res)
             if expected:
-                model.append(Auth(f"ntx_{step}", held=amount))
+                model.append(Auth(f"ntx_{step}", card, held=amount))
 
         elif op == "reverse":
             a = data.draw(st.sampled_from(pending), label="auth")
