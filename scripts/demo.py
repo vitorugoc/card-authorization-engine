@@ -90,14 +90,14 @@ print(f"   invariant month spend <= limit: {GREEN + 'OK' if ok else RED + 'VIOLA
 state()
 
 step(5, "Partial reversal: restaurant releases 20.00 of the lunch hold")
-res = client.post("/v1/authorizations/ntx_lunch/reversals", json={"event_id": "evt_rev_1",
-                                                                  "amount": 2_000}).json()  # fmt: skip
+reversal = {"event_id": "evt_rev_1", "amount": 2_000}
+res = client.post("/v1/authorizations/ntx_lunch/reversals", json=reversal).json()
 print(f"   status {res['status']}, hold now {money(res['held_amount'])}")
 state()
 
 step(6, "Clearing arrives at 138.00 (tip added): posted in full, rest of hold released")
-res = client.post("/v1/authorizations/ntx_lunch/clearings", json={"event_id": "evt_clr_1",
-                                                                  "amount": 13_800}).json()  # fmt: skip
+clearing = {"event_id": "evt_clr_1", "amount": 13_800}
+res = client.post("/v1/authorizations/ntx_lunch/clearings", json=clearing).json()
 print(f"   status {res['status']}, posted {money(res['cleared_amount'])},"
       f" hold {money(res['held_amount'])}")  # fmt: skip
 state()
