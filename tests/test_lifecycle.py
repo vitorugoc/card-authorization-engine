@@ -142,3 +142,26 @@ def test_every_change_has_an_event_row(card: str) -> None:
         ("evt_r1", "reversal", 2_000),
         ("evt_c1", "clearing", 10_000),
     ]
+
+
+def test_full_reversal_retry_with_explicit_amount_is_a_replay(card: str) -> None:
+    approve(amount=12_000)
+    first = reverse("evt_r1")  # amount omitted = whole remaining hold
+
+    assert reverse("evt_r1", amount=12_000) == first  # same event, amount now explicit
+    assert sql("SELECT count(*) FROM authorization_events") == [(1,)]
+
+
+def test_explicit_full_reversal_retry_without_amount_is_a_replay(card: str) -> None:
+    approve(amount=12_000)
+    first = reverse("evt_r1", amount=12_000)
+
+    assert reverse("evt_r1") == first
+
+
+def test_partial_reversal_retry_without_amount_409(card: str) -> None:
+    approve(amount=12_000)
+    reverse("evt_r1", amount=2_000)
+
+    # Omitted amount means "release everything"; the original event released 2,000 only.
+    assert error_code(lambda: reverse("evt_r1")) == (409, "idempotency_mismatch")
