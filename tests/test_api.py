@@ -29,3 +29,10 @@ def test_api_rejects_bad_mcc_and_currency_422(card: str) -> None:
 def test_api_ignores_unknown_processor_fields(card: str) -> None:
     res = client.post("/v1/authorizations", json=payload(new_processor_field="x"))
     assert res.status_code == 200
+
+
+def test_api_idempotency_mismatch_is_409(card: str) -> None:
+    client.post("/v1/authorizations", json=payload())
+    res = client.post("/v1/authorizations", json=payload(amount=99_000))
+    assert res.status_code == 409
+    assert res.json() == {"error": "idempotency_mismatch"}
