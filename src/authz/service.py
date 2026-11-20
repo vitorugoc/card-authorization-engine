@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 
 from authz.db import pool
 from authz.models import AuthorizationRequest
-from authz.policy import CompanyState, evaluate
+from authz.policy import CardState, CompanyState, available, evaluate
 
 log = logging.getLogger("authz")
 
@@ -63,6 +63,27 @@ def _company_state(conn: Conn, company: DictRow) -> CompanyState:
     )
 
 
+def _card_state(conn: Conn, card_id: str) -> CardState:
+    row = conn.execute(
+        """SELECT c.status, c.per_txn_limit, c.monthly_limit, c.blocked_mccs,
+                  (SELECT COALESCE(SUM(a.held_amount + a.cleared_amount), 0)::bigint
+                   FROM authorizations a
+                   WHERE a.card_id = c.id
+                     AND a.created_at >= date_trunc('month', now() AT TIME ZONE 'UTC')
+                                         AT TIME ZONE 'UTC') AS monthly_spend
+           FROM cards c WHERE c.id = %s""",
+        (card_id,),
+    ).fetchone()
+    assert row is not None
+    return CardState(
+        status=row["status"],
+        per_txn_limit=row["per_txn_limit"],
+        monthly_limit=row["monthly_limit"],
+        blocked_mccs=frozenset(row["blocked_mccs"]),
+        monthly_spend=row["monthly_spend"],
+    )
+
+
 # --- authorization -------------------------------------------------------------------------
 
 
@@ -75,7 +96,17 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
             return _response(None, req, "declined", "card_not_found", ["card_not_found"], None)
 
         company = _company_state(conn, _lock_company(conn, card["company_id"]))
-        decision = evaluate(req.amount, company)
+        # Re-read the card under the lock: a concurrent freeze/limit change can't race us.
+        card_state = _card_state(conn, req.card_id)
+        decision = evaluate(req.amount, req.currency, req.mcc, card_state, company)
+        snapshot = {
+            "status": card_state.status,
+            "per_txn_limit": card_state.per_txn_limit,
+            "monthly_limit": card_state.monthly_limit,
+            "blocked_mccs": sorted(card_state.blocked_mccs),
+            "card_monthly_spend": card_state.monthly_spend,
+            "company_available": available(company),
+        }
 
         auth_id = _new_id("auth")
         status = "pending" if decision.approved else "declined"
@@ -100,7 +131,7 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
                 req.mcc, req.merchant_name, req.merchant_country,
                 status, decision.decline_code, list(decision.reasons),
                 req.amount if decision.approved else 0,
-                Jsonb({}), "", Jsonb(response),
+                Jsonb(snapshot), "", Jsonb(response),
             ),
         )  # fmt: skip
     log.info("authorization.decided %s %.1fms", response, (time.perf_counter() - started) * 1000)
