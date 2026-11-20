@@ -10,7 +10,18 @@ from psycopg import OperationalError
 
 from authz import logging as authz_logging
 from authz import service
-from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, ReversalRequest
+from authz.models import (
+    AuthorizationRequest,
+    AuthorizationResponse,
+    AuthorizationView,
+    CardPatch,
+    CardView,
+    ClearingRequest,
+    CompanyView,
+    ErrorResponse,
+    EventResponse,
+    ReversalRequest,
+)
 from authz.service import DomainError
 
 authz_logging.configure()
@@ -46,41 +57,45 @@ def health() -> dict[str, str]:
 # --- processor-facing ----------------------------------------------------------------------
 
 
-@app.post("/v1/authorizations")
-def authorize(req: AuthorizationRequest) -> dict[str, Any]:
+def errors(*statuses: int) -> dict[int | str, dict[str, Any]]:
+    return {status: {"model": ErrorResponse} for status in statuses}
+
+
+@app.post("/v1/authorizations", responses=errors(409))
+def authorize(req: AuthorizationRequest) -> AuthorizationResponse:
     """Approve or decline. A decline is a business outcome: HTTP 200 (ADR 0005)."""
-    return service.authorize(req)
+    return AuthorizationResponse.model_validate(service.authorize(req))
 
 
-@app.post("/v1/authorizations/{network_transaction_id}/reversals")
-def reverse(network_transaction_id: str, req: ReversalRequest) -> dict[str, Any]:
-    return service.reverse(network_transaction_id, req)
+@app.post("/v1/authorizations/{network_transaction_id}/reversals", responses=errors(404, 409, 503))
+def reverse(network_transaction_id: str, req: ReversalRequest) -> EventResponse:
+    return EventResponse.model_validate(service.reverse(network_transaction_id, req))
 
 
-@app.post("/v1/authorizations/{network_transaction_id}/clearings")
-def clear(network_transaction_id: str, req: ClearingRequest) -> dict[str, Any]:
-    return service.clear(network_transaction_id, req)
+@app.post("/v1/authorizations/{network_transaction_id}/clearings", responses=errors(404, 409, 503))
+def clear(network_transaction_id: str, req: ClearingRequest) -> EventResponse:
+    return EventResponse.model_validate(service.clear(network_transaction_id, req))
 
 
 # --- ops -----------------------------------------------------------------------------------
 
 
-@app.get("/v1/companies/{company_id}")
-def get_company(company_id: str) -> dict[str, Any]:
-    return service.get_company(company_id)
+@app.get("/v1/companies/{company_id}", responses=errors(404))
+def get_company(company_id: str) -> CompanyView:
+    return CompanyView.model_validate(service.get_company(company_id))
 
 
-@app.get("/v1/cards/{card_id}")
-def get_card(card_id: str) -> dict[str, Any]:
-    return service.get_card(card_id)
+@app.get("/v1/cards/{card_id}", responses=errors(404))
+def get_card(card_id: str) -> CardView:
+    return CardView.model_validate(service.get_card(card_id))
 
 
-@app.patch("/v1/cards/{card_id}")
-def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
+@app.patch("/v1/cards/{card_id}", responses=errors(404))
+def update_card(card_id: str, patch: CardPatch) -> CardView:
     # ponytail: unauthenticated for the local demo; first thing to lock down (WRITEUP).
-    return service.update_card(card_id, patch)
+    return CardView.model_validate(service.update_card(card_id, patch))
 
 
 @app.get("/v1/cards/{card_id}/authorizations")
-def list_card_authorizations(card_id: str) -> list[dict[str, Any]]:
-    return service.list_card_authorizations(card_id)
+def list_card_authorizations(card_id: str) -> list[AuthorizationView]:
+    return [AuthorizationView.model_validate(r) for r in service.list_card_authorizations(card_id)]

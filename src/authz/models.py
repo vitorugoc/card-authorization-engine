@@ -1,5 +1,6 @@
 """Request models: the trust boundary. Everything past here is validated."""
 
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -51,3 +52,73 @@ class CardPatch(BaseModel):
     per_txn_limit: Amount | None = None
     monthly_limit: Amount | None = None
     blocked_mccs: list[Mcc] | None = Field(default=None, max_length=100)
+
+
+# --- responses: the outbound contract (rendered in OpenAPI) --------------------------------
+
+AuthStatus = Literal["declined", "pending", "reversed", "cleared"]
+
+
+class AuthorizationResponse(BaseModel):
+    authorization_id: str | None  # None when nothing was persisted (card_not_found, system_error)
+    network_transaction_id: str
+    decision: Literal["approved", "declined"]
+    decline_code: str | None
+    reasons: list[str]
+    available_credit_after: int | None
+
+
+class EventResponse(BaseModel):
+    authorization_id: str
+    network_transaction_id: str
+    event_id: str
+    type: Literal["reversal", "clearing"]
+    amount: int
+    status: AuthStatus
+    held_amount: int
+    cleared_amount: int
+    available_credit_after: int
+
+
+class CompanyView(BaseModel):
+    id: str
+    name: str
+    currency: str
+    credit_limit: int
+    held: int
+    posted: int
+    available: int
+
+
+class CardView(BaseModel):
+    id: str
+    company_id: str
+    holder_name: str
+    last4: str
+    status: Literal["active", "frozen"]
+    per_txn_limit: int
+    monthly_limit: int
+    blocked_mccs: list[str]
+    monthly_spend: int
+
+
+class AuthorizationView(BaseModel):
+    id: str
+    network_transaction_id: str
+    amount: int
+    currency: str
+    merchant_amount: int
+    merchant_currency: str
+    mcc: str
+    merchant_name: str
+    merchant_country: str
+    status: AuthStatus
+    decline_code: str | None
+    reasons: list[str]
+    held_amount: int
+    cleared_amount: int
+    created_at: datetime
+
+
+class ErrorResponse(BaseModel):
+    error: str
