@@ -16,6 +16,5 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
            VALUES ('card_demo', 'co_demo', 'Ana Souza', '4242', 'active',
                    50000, 100000, '{7995}')"""  # 500.00/txn, 1,000.00/month, no gambling
     )
-print(
-    "seeded: co_demo (10,000.00 MXN credit), card_demo (500.00/txn, 1,000.00/month, MCC 7995 blocked)"
-)
+print("seeded: co_demo (10,000.00 MXN credit)")
+print("        card_demo (500.00/txn, 1,000.00/month, MCC 7995 blocked)")
