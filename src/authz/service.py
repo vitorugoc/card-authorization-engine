@@ -1,11 +1,13 @@
 """Transaction scripts. Every money write locks the company row first (ADR 0002)."""
 
+import hashlib
+import json
 import logging
 import time
 import uuid
 from typing import Any
 
-from psycopg import Connection
+from psycopg import Connection, errors
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
@@ -84,18 +86,66 @@ def _card_state(conn: Conn, card_id: str) -> CardState:
     )
 
 
+# --- idempotency (ADR 0003) ----------------------------------------------------------------
+
+_STORED = {
+    "authorization": (
+        "SELECT request_hash, response FROM authorizations WHERE network_transaction_id = %s"
+    ),
+    "event": "SELECT request_hash, response FROM authorization_events WHERE event_id = %s",
+}
+
+
+def request_hash(fields: dict[str, Any]) -> str:
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _stored_response(conn: Conn, kind: str, key: str, req_hash: str) -> dict[str, Any] | None:
+    """Stored response for a replay; 409 if the same id arrives with a different payload."""
+    row = conn.execute(_STORED[kind], (key,)).fetchone()
+    if row is None:
+        return None
+    if row["request_hash"] != req_hash:
+        log.warning("idempotency.mismatch kind=%s key=%s", kind, key)
+        raise DomainError(409, "idempotency_mismatch")
+    response: dict[str, Any] = row["response"]
+    return response
+
+
 # --- authorization -------------------------------------------------------------------------
 
 
 def authorize(req: AuthorizationRequest) -> dict[str, Any]:
     started = time.perf_counter()
+    req_hash = request_hash(req.decision_fields())
+    try:
+        response = _authorize(req, req_hash)
+    except errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != "authorizations_network_transaction_id_key":
+            raise
+        # Same ntid committed meanwhile by a transaction holding ANOTHER company's lock.
+        with pool().connection() as conn:
+            stored = _stored_response(conn, "authorization", req.network_transaction_id, req_hash)
+        assert stored is not None
+        response = stored
+    log.info("authorization.decided %s %.1fms", response, (time.perf_counter() - started) * 1000)
+    return response
+
+
+def _authorize(req: AuthorizationRequest, req_hash: str) -> dict[str, Any]:
     with pool().connection() as conn:
         _begin(conn)
         card = conn.execute("SELECT company_id FROM cards WHERE id = %s", (req.card_id,)).fetchone()
         if card is None:
             return _response(None, req, "declined", "card_not_found", ["card_not_found"], None)
 
-        company = _company_state(conn, _lock_company(conn, card["company_id"]))
+        locked = _lock_company(conn, card["company_id"])
+        # Lookup AFTER the lock: concurrent duplicates serialize and the second sees the first.
+        stored = _stored_response(conn, "authorization", req.network_transaction_id, req_hash)
+        if stored is not None:
+            return stored
+        company = _company_state(conn, locked)
         # Re-read the card under the lock: a concurrent freeze/limit change can't race us.
         card_state = _card_state(conn, req.card_id)
         decision = evaluate(req.amount, req.currency, req.mcc, card_state, company)
@@ -131,10 +181,9 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
                 req.mcc, req.merchant_name, req.merchant_country,
                 status, decision.decline_code, list(decision.reasons),
                 req.amount if decision.approved else 0,
-                Jsonb(snapshot), "", Jsonb(response),
+                Jsonb(snapshot), req_hash, Jsonb(response),
             ),
         )  # fmt: skip
-    log.info("authorization.decided %s %.1fms", response, (time.perf_counter() - started) * 1000)
     return response
 
 
