@@ -16,10 +16,14 @@ COMPANY = "co_test"
 CARD = "card_test"
 
 
-@pytest.fixture(autouse=True)
-def clean_db() -> None:
+def truncate() -> None:
     with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
         conn.execute(f"TRUNCATE {TABLES} CASCADE")
+
+
+@pytest.fixture(autouse=True)
+def clean_db() -> None:
+    truncate()
 
 
 def sql(query: str, params: Iterable[Any] = ()) -> list[tuple[Any, ...]]:
