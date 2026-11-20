@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker compose build
+      - name: Lint (ruff + mypy --strict)
+        run: make lint
+      - name: Test (real Postgres)
+        run: make test
+      - name: Demo end-to-end
+        run: |
+          make up
+          make demo
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs

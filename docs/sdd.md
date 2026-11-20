@@ -27,7 +27,7 @@ same company arrive **at the same time**.
 
 **Out of scope (named in the write-up):** disputes, incremental auth, FX conversion, hold expiry,
 multi-clearing / force-post, late clearing after reversal, double-entry ledger, repayments,
-HMAC signature verification, ops authentication, TLS, rate limiting, stand-in logic, company
+ops authentication, TLS, rate limiting, stand-in logic, company
 timezones, metrics endpoint.
 
 ## 3. Glossary
@@ -266,7 +266,7 @@ There are no interfaces, repositories or rule registries. Each module has one im
 - **Input.** Strict validation at the boundary (§5) and parameterized SQL only.
 - **Card data.** No PAN, CVV or expiry is stored. `card_id` is the processor token, and only `last4` is kept.
 - **Errors.** `system_error` responses are generic and expose no internals.
-- **Out of scope (named in the write-up):** HMAC verification, authentication on the ops routes (PATCH is the first thing to lock down), TLS, rate limiting and secrets management.
+- **Out of scope (named in the write-up):** authentication on the ops routes (PATCH is the first thing to lock down), TLS, rate limiting and secrets management.
 
 ## 12. Test strategy
 
@@ -362,7 +362,7 @@ Demo seed (fixed IDs):
 - **Per-company hot row.** All authorizations for one company are serialized. Upgrade path: per-card locks plus a company reservation counter, or sharded balances.
 - **SUM cost grows with history.** Upgrade path: materialized running balances maintained by a ledger.
 - **Model gaps:** no double-entry ledger, hold expiry, multi-clearing, force-post or late clearing after reversal, and no company timezone for the monthly window.
-- **Production hardening:** HMAC webhook verification, ops authentication, stand-in reconciliation, Prometheus metrics.
+- **Production hardening:** ops authentication, stand-in reconciliation, Prometheus metrics.
 
 ## 15. Definition of done
 
@@ -385,3 +385,10 @@ Places where the implementation differs from the original plan:
   - Removing `FOR UPDATE` makes both burst tests fail.
   - Removing the UNIQUE-race handling makes the race tests fail.
   - A `>`→`>=` change on the monthly limit or the credit check is caught by the unit boundary tests and by the property test.
+- **Added after the scope review (2026-11-20):**
+  - **HMAC-SHA256 webhook signatures** (`signature.py`). The header is `X-Signature: t=<unix>,v1=<hex>` over `"<t>." + raw body`, with 300s tolerance and constant-time compare. The check runs as a router dependency before body validation, so an unsigned call gets 401, not 422.
+  - **Typed response models** with documented error schemas in OpenAPI.
+  - **Explicit integrity errors** replace `assert` in production code.
+  - **Event replays compare the resolved amount.** An omitted reversal amount means "the whole remaining hold", so it matches an explicit amount that released everything.
+  - **`make loadtest`** produces the measured numbers in README → Performance.
+  - **CI** (`.github/workflows/ci.yml`) runs lint, test and the demo.

@@ -1,4 +1,6 @@
 ### Requests for the REST Client (VS Code) / JetBrains HTTP client. Run `make seed` first.
+### Processor routes (authorize / reversal / clearing) need an HMAC `X-Signature` header and
+### return 401 from here as-is; see scripts/demo.py `signed_post`. Ops routes work unsigned.
 @api = http://localhost:8000
 
 ### Authorize (cross-border: merchant charged USD, network bills MXN)

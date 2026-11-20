@@ -1,6 +1,6 @@
 RUN = docker compose run --rm app
 
-.PHONY: up down reset test lint fmt seed demo demo-live logs
+.PHONY: up down reset test lint fmt seed demo demo-live logs loadtest
 
 up:     ## build and start db + api on :8000
 	docker compose up -d --build --wait
@@ -30,3 +30,6 @@ logs:
 
 demo-live: seed  ## same demo, pauses for Enter between steps (for recording)
 	$(RUN) python scripts/demo.py --pause
+
+loadtest:  ## latency/throughput, one hot company vs 16 companies (wipes demo data)
+	$(RUN) python scripts/loadtest.py

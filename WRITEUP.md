@@ -15,7 +15,7 @@ A Python service that a card processor calls synchronously for each swipe. It:
 - places a hold on the company credit line;
 - handles reversals (full/partial) and a final clearing.
 
-There are 59 tests against a real Postgres, and a narrated demo (`make demo`).
+There are 74 tests against a real Postgres, a narrated demo (`make demo`) and a load test (`make loadtest`). Processor webhooks are HMAC-signed.
 
 **Two guarantees, each proven by tests:**
 1. **No overspend under concurrency.** Every money or policy write locks the company row (`SELECT … FOR UPDATE`). Balances are derived by `SUM` under that lock, and CHECK constraints enforce the hold invariants. A burst of 20 concurrent auths approves exactly as many as fit. When I removed the lock, the test failed.
@@ -26,7 +26,7 @@ There are 59 tests against a real Postgres, and a narrated demo (`make demo`).
    A cross-company race on the same id is caught by the UNIQUE constraint and resolved.
 
 ## Key decisions and trade-offs
-- **Pessimistic per-company lock vs SERIALIZABLE/optimistic.** It gives a guarantee instead of retry loops, and one lock target means no deadlocks. The ceiling is one hot row per company. The upgrade path is per-card locks plus a reservation counter.
+- **Pessimistic per-company lock vs SERIALIZABLE/optimistic.** It gives a guarantee instead of retry loops, and one lock target means no deadlocks. The ceiling is one hot row per company, and I measured it. A single company tops out at about 240 auth/s at 16 or 64 concurrent clients; more clients only add queueing time. Spread over 16 companies, throughput grows to about 750 req/s. Zero `system_error` in all runs. The upgrade path is per-card locks plus a reservation counter.
 - **Derived balances, no double-entry ledger (yet).** Authorization rows are the source of truth, so no counter can drift. The cost is `SUM` over history. A ledger fed by clearings is the next step.
 - **Declines are HTTP 200; timeouts fail closed** (`system_error` after a 200ms lock wait). Stand-in generosity is processor configuration, not engine logic.
 - **Over-clear is posted** even past the limit. Policy is enforced at authorization; clearing records what the network already settled.
@@ -34,7 +34,7 @@ There are 59 tests against a real Postgres, and a narrated demo (`make demo`).
   - integer minor units, one currency per company (the network does FX);
   - UTC month window;
   - no hold expiry;
-  - no HMAC/ops authentication (named as the first production gaps).
+  - no authentication on the ops routes (the first production gap). Processor webhooks are HMAC-signed, Stripe-style, and the signature is checked before body validation.
 
 ## How I used AI
 1. **Design by "grilling".** I chose the problem and the stack. An AI agent prompted as a staff fintech engineer then answered a structured design interview in rounds (19 decisions, each with rejected alternatives). I reviewed and approved every decision at a checkpoint. Log: `docs/grill-log.md`.
@@ -51,7 +51,7 @@ There are 59 tests against a real Postgres, and a narrated demo (`make demo`).
 ## What I'd do next
 - Double-entry ledger and repayments.
 - Hold expiry.
-- HMAC webhook verification and ops authentication.
+- Ops authentication (PATCH card first).
 - Stand-in reconciliation.
 - Multi-clearing and force-post.
 - Company timezone for monthly limits.
