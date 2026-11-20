@@ -107,7 +107,7 @@ def _stored_response(conn: Conn, kind: str, key: str, req_hash: str) -> dict[str
     if row is None:
         return None
     if row["request_hash"] != req_hash:
-        log.warning("idempotency.mismatch kind=%s key=%s", kind, key)
+        log.warning("idempotency.mismatch", extra={"fields": {"kind": kind, "key": key}})
         raise DomainError(409, "idempotency_mismatch")
     response: dict[str, Any] = row["response"]
     return response
@@ -138,30 +138,43 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
     started = time.perf_counter()
     req_hash = request_hash(req.decision_fields())
     try:
-        response = _authorize(req, req_hash)
+        response, replay = _authorize(req, req_hash)
     except errors.UniqueViolation as exc:
         response = _replay_after_race(exc, "authorization", req.network_transaction_id, req_hash)
+        replay = True
     except OperationalError:
         # Lock/statement timeout, pool exhaustion, DB down: fail closed, inside the network
         # window. How generous to be on failure is stand-in config at the processor (ADR 0005).
-        log.exception("authorization.system_error ntid=%s", req.network_transaction_id)
+        log.exception(
+            "authorization.system_error",
+            extra={"fields": {"network_transaction_id": req.network_transaction_id}},
+        )
         return _response(None, req, "declined", "system_error", ["system_error"], None)
-    log.info("authorization.decided %s %.1fms", response, (time.perf_counter() - started) * 1000)
+    # Never log holder_name: the only PII we hold.
+    fields = {
+        **response,
+        **req.decision_fields(),
+        "replay": replay,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+    }
+    log.info("authorization.decided", extra={"fields": fields})
     return response
 
 
-def _authorize(req: AuthorizationRequest, req_hash: str) -> dict[str, Any]:
+def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any], bool]:
+    """Returns (response, replay)."""
     with pool().connection() as conn:
         _begin(conn)
         card = conn.execute("SELECT company_id FROM cards WHERE id = %s", (req.card_id,)).fetchone()
         if card is None:
-            return _response(None, req, "declined", "card_not_found", ["card_not_found"], None)
+            response = _response(None, req, "declined", "card_not_found", ["card_not_found"], None)
+            return response, False
 
         locked = _lock_company(conn, card["company_id"])
         # Lookup AFTER the lock: concurrent duplicates serialize and the second sees the first.
         stored = _stored_response(conn, "authorization", req.network_transaction_id, req_hash)
         if stored is not None:
-            return stored
+            return stored, True
         company = _company_state(conn, locked)
         # Re-read the card under the lock: a concurrent freeze/limit change can't race us.
         card_state = _card_state(conn, req.card_id)
@@ -201,7 +214,7 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> dict[str, Any]:
                 Jsonb(snapshot), req_hash, Jsonb(response),
             ),
         )  # fmt: skip
-    return response
+    return response, False
 
 
 def _response(
@@ -241,7 +254,7 @@ def _apply_event(ntid: str, type_: str, event_id: str, amount: int | None) -> di
         response = _apply_event_tx(ntid, type_, event_id, amount, req_hash)
     except errors.UniqueViolation as exc:
         return _replay_after_race(exc, "event", event_id, req_hash)
-    log.info("%s.applied %s", type_, response)
+    log.info(f"{type_}.applied", extra={"fields": response})
     return response
 
 
@@ -280,7 +293,8 @@ def _apply_event_tx(
             assert amount is not None
             applied, new_held, cleared, status = amount, 0, amount, "cleared"
             if amount > held:
-                log.info("clearing.over_clear ntid=%s over_clear_delta=%d", ntid, amount - held)
+                over = {"network_transaction_id": ntid, "over_clear_delta": amount - held}
+                log.info("clearing.over_clear", extra={"fields": over})
 
         conn.execute(
             "UPDATE authorizations SET status = %s, held_amount = %s, cleared_amount = %s"
@@ -327,7 +341,7 @@ def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
                 sql.SQL("UPDATE cards SET {} WHERE id = %s").format(assignments),
                 (*changes.values(), card_id),
             )
-    log.info("card.updated card_id=%s changes=%s", card_id, changes)
+    log.info("card.updated", extra={"fields": {"card_id": card_id, "changes": changes}})
     return get_card(card_id)
 
 

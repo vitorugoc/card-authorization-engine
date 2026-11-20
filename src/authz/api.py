@@ -8,10 +8,12 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 
+from authz import logging as authz_logging
 from authz import service
 from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, ReversalRequest
 from authz.service import DomainError
 
+authz_logging.configure()
 app = FastAPI(title="Card Authorization Engine")
 
 
