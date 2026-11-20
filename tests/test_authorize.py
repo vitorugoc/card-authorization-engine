@@ -62,17 +62,17 @@ def test_decision_stores_policy_snapshot(card: str) -> None:
 
 
 def test_monthly_limit_counts_holds_and_cleared_current_month_only(card: str) -> None:
+    # An auth from last month must not count against this month's limit.
+    assert service.authorize(auth_request("ntx_old", amount=50_000))["decision"] == "approved"
+    sql(
+        "UPDATE authorizations SET created_at = date_trunc('month', now()) - interval '1 day'"
+        " WHERE network_transaction_id = 'ntx_old'"
+    )
     service.authorize(auth_request("ntx_a", amount=40_000))
     service.authorize(auth_request("ntx_b", amount=30_000))
     sql(
         "UPDATE authorizations SET status = 'cleared', held_amount = 0, cleared_amount = 30000"
         " WHERE network_transaction_id = 'ntx_b'"
-    )
-    # An old auth from last month must not count against this month's limit.
-    service.authorize(auth_request("ntx_old", amount=50_000))
-    sql(
-        "UPDATE authorizations SET created_at = date_trunc('month', now()) - interval '1 day'"
-        " WHERE network_transaction_id = 'ntx_old'"
     )
 
     # 40,000 held + 30,000 cleared this month: 30,000 left of 100,000.
