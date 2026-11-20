@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any
 
-from psycopg import Connection, errors
+from psycopg import Connection, OperationalError, errors
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
@@ -129,6 +129,11 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
             stored = _stored_response(conn, "authorization", req.network_transaction_id, req_hash)
         assert stored is not None
         response = stored
+    except OperationalError:
+        # Lock/statement timeout, pool exhaustion, DB down: fail closed, inside the network
+        # window. How generous to be on failure is stand-in config at the processor (ADR 0005).
+        log.exception("authorization.system_error ntid=%s", req.network_transaction_id)
+        return _response(None, req, "declined", "system_error", ["system_error"], None)
     log.info("authorization.decided %s %.1fms", response, (time.perf_counter() - started) * 1000)
     return response
 
