@@ -1,4 +1,6 @@
+import json
 import os
+import time
 
 # Tests never touch the demo database.
 os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
@@ -8,6 +10,7 @@ from typing import Any
 
 import psycopg
 import pytest
+from authz.signature import sign
 
 from authz.models import AuthorizationRequest
 
@@ -81,8 +84,17 @@ def auth_request(
     return AuthorizationRequest(**{**fields, **overrides})
 
 
+def signed_post(client: Any, path: str, payload: dict[str, Any]) -> Any:
+    """POST exactly the bytes that were signed, like a real processor."""
+    body = json.dumps(payload).encode()
+    header = sign(os.environ["WEBHOOK_SECRET"], body, int(time.time()))
+    return client.post(
+        path, content=body, headers={"Content-Type": "application/json", "X-Signature": header}
+    )
+
+
 def client_post(client: Any, req: AuthorizationRequest) -> dict[str, Any]:
-    res = client.post("/v1/authorizations", json=req.model_dump())
+    res = signed_post(client, "/v1/authorizations", req.model_dump())
     assert res.status_code == 200, res.text
     body: dict[str, Any] = res.json()
     return body
