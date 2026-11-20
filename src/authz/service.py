@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from psycopg import Connection, OperationalError, errors, sql
@@ -39,13 +40,21 @@ def _begin(conn: Conn) -> None:
     conn.execute("SET LOCAL statement_timeout = '1s'")
 
 
-def _lock_company(conn: Conn, company_id: str) -> DictRow:
-    row = conn.execute(
-        "SELECT id, currency, credit_limit FROM companies WHERE id = %s FOR UPDATE",
-        (company_id,),
-    ).fetchone()
-    assert row is not None  # FK guarantees it
+def _one(row: DictRow | None, what: str) -> DictRow:
+    """A row the schema guarantees (FK, aggregate). Missing = integrity bug, never a 4xx."""
+    if row is None:
+        raise RuntimeError(f"expected {what}")
     return row
+
+
+def _lock_company(conn: Conn, company_id: str) -> DictRow:
+    return _one(
+        conn.execute(
+            "SELECT id, currency, credit_limit FROM companies WHERE id = %s FOR UPDATE",
+            (company_id,),
+        ).fetchone(),
+        "company row",
+    )
 
 
 def _company_state(conn: Conn, company: DictRow) -> CompanyState:
@@ -56,7 +65,7 @@ def _company_state(conn: Conn, company: DictRow) -> CompanyState:
            WHERE company_id = %s AND status IN ('pending', 'cleared')""",
         (company["id"],),
     ).fetchone()
-    assert totals is not None
+    totals = _one(totals, "company totals")
     return CompanyState(
         currency=company["currency"],
         credit_limit=company["credit_limit"],
@@ -76,7 +85,7 @@ def _card_state(conn: Conn, card_id: str) -> CardState:
            FROM cards c WHERE c.id = %s""",
         (card_id,),
     ).fetchone()
-    assert row is not None
+    row = _one(row, "card row")
     return CardState(
         status=row["status"],
         per_txn_limit=row["per_txn_limit"],
@@ -101,12 +110,34 @@ def request_hash(fields: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _stored_response(conn: Conn, kind: str, key: str, req_hash: str) -> dict[str, Any] | None:
+Matcher = Callable[[DictRow], bool]
+
+
+def _same_hash(req_hash: str) -> Matcher:
+    return lambda row: bool(row["request_hash"] == req_hash)
+
+
+def _same_event(ntid: str, type_: str, amount: int | None) -> Matcher:
+    """Compare the RESOLVED request: an omitted reversal amount means "the whole remaining
+    hold", so it matches an explicit amount that released everything, and vice versa."""
+
+    def matches(row: DictRow) -> bool:
+        stored = row["response"]
+        if (stored["network_transaction_id"], stored["type"]) != (ntid, type_):
+            return False
+        if amount is None:
+            return bool(stored["type"] == "reversal" and stored["status"] == "reversed")
+        return bool(amount == stored["amount"])
+
+    return matches
+
+
+def _stored_response(conn: Conn, kind: str, key: str, matches: Matcher) -> dict[str, Any] | None:
     """Stored response for a replay; 409 if the same id arrives with a different payload."""
     row = conn.execute(_STORED[kind], (key,)).fetchone()
     if row is None:
         return None
-    if row["request_hash"] != req_hash:
+    if not matches(row):
         log.warning("idempotency.mismatch", extra={"fields": {"kind": kind, "key": key}})
         raise DomainError(409, "idempotency_mismatch")
     response: dict[str, Any] = row["response"]
@@ -120,14 +151,15 @@ _UNIQUE_KEYS = {
 
 
 def _replay_after_race(
-    exc: errors.UniqueViolation, kind: str, key: str, req_hash: str
+    exc: errors.UniqueViolation, kind: str, key: str, matches: Matcher
 ) -> dict[str, Any]:
     """The same id was committed meanwhile under ANOTHER company's lock; UNIQUE caught it."""
     if exc.diag.constraint_name != _UNIQUE_KEYS[kind]:
         raise exc
     with pool().connection() as conn:
-        stored = _stored_response(conn, kind, key, req_hash)
-    assert stored is not None
+        stored = _stored_response(conn, kind, key, matches)
+    if stored is None:
+        raise RuntimeError(f"UNIQUE violation on {kind} {key} but no committed row")
     return stored
 
 
@@ -140,7 +172,9 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
     try:
         response, replay = _authorize(req, req_hash)
     except errors.UniqueViolation as exc:
-        response = _replay_after_race(exc, "authorization", req.network_transaction_id, req_hash)
+        response = _replay_after_race(
+            exc, "authorization", req.network_transaction_id, _same_hash(req_hash)
+        )
         replay = True
     except OperationalError:
         # Lock/statement timeout, pool exhaustion, DB down: fail closed, inside the network
@@ -172,7 +206,9 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
 
         locked = _lock_company(conn, card["company_id"])
         # Lookup AFTER the lock: concurrent duplicates serialize and the second sees the first.
-        stored = _stored_response(conn, "authorization", req.network_transaction_id, req_hash)
+        stored = _stored_response(
+            conn, "authorization", req.network_transaction_id, _same_hash(req_hash)
+        )
         if stored is not None:
             return stored, True
         company = _company_state(conn, locked)
@@ -249,18 +285,15 @@ def clear(ntid: str, req: ClearingRequest) -> dict[str, Any]:
 
 
 def _apply_event(ntid: str, type_: str, event_id: str, amount: int | None) -> dict[str, Any]:
-    req_hash = request_hash({"ntid": ntid, "type": type_, "amount": amount})
     try:
-        response = _apply_event_tx(ntid, type_, event_id, amount, req_hash)
+        response = _apply_event_tx(ntid, type_, event_id, amount)
     except errors.UniqueViolation as exc:
-        return _replay_after_race(exc, "event", event_id, req_hash)
+        return _replay_after_race(exc, "event", event_id, _same_event(ntid, type_, amount))
     log.info(f"{type_}.applied", extra={"fields": response})
     return response
 
 
-def _apply_event_tx(
-    ntid: str, type_: str, event_id: str, amount: int | None, req_hash: str
-) -> dict[str, Any]:
+def _apply_event_tx(ntid: str, type_: str, event_id: str, amount: int | None) -> dict[str, Any]:
     with pool().connection() as conn:
         _begin(conn)
         found = conn.execute(
@@ -269,7 +302,7 @@ def _apply_event_tx(
         if found is None:
             raise DomainError(404, "authorization_not_found")
         locked = _lock_company(conn, found["company_id"])
-        stored = _stored_response(conn, "event", event_id, req_hash)
+        stored = _stored_response(conn, "event", event_id, _same_event(ntid, type_, amount))
         if stored is not None:
             return stored
 
@@ -278,7 +311,7 @@ def _apply_event_tx(
             " WHERE network_transaction_id = %s",
             (ntid,),
         ).fetchone()
-        assert auth is not None
+        auth = _one(auth, "authorization row")
         if auth["status"] != "pending":
             raise DomainError(409, "authorization_not_pending")
 
@@ -290,7 +323,8 @@ def _apply_event_tx(
             new_held, cleared = held - applied, 0
             status = "pending" if new_held else "reversed"
         else:
-            assert amount is not None
+            if amount is None:
+                raise ValueError("a clearing always carries an amount")
             applied, new_held, cleared, status = amount, 0, amount, "cleared"
             if amount > held:
                 over = {"network_transaction_id": ntid, "over_clear_delta": amount - held}
@@ -316,7 +350,15 @@ def _apply_event_tx(
             """INSERT INTO authorization_events
                  (id, event_id, authorization_id, type, amount, request_hash, response)
                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            (_new_id("evt"), event_id, auth["id"], type_, applied, req_hash, Jsonb(response)),
+            (
+                _new_id("evt"),
+                event_id,
+                auth["id"],
+                type_,
+                applied,
+                request_hash({"ntid": ntid, "type": type_, "amount": applied}),  # resolved
+                Jsonb(response),
+            ),
         )
     return response
 
