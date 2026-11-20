@@ -27,3 +27,17 @@ class AuthorizationRequest(BaseModel):
     def decision_fields(self) -> dict[str, Any]:
         """Fields that change the decision; their hash is the idempotency fingerprint."""
         return self.model_dump(include={"card_id", "amount", "currency", "mcc", "merchant_country"})
+
+
+class ReversalRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    event_id: Id
+    amount: Amount | None = None  # None = release the whole remaining hold
+
+
+class ClearingRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    event_id: Id
+    amount: Amount  # may differ from the authorized amount (tips, fuel, FX movement)

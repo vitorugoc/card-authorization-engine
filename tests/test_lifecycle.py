@@ -108,7 +108,10 @@ def test_reversal_of_declined_409(card: str) -> None:
 
 
 def test_unknown_ntid_404(card: str) -> None:
-    assert error_code(lambda: reverse("evt_r1", ntid="ntx_nope")) == (404, "authorization_not_found")
+    assert error_code(lambda: reverse("evt_r1", ntid="ntx_nope")) == (
+        404,
+        "authorization_not_found",
+    )
     assert error_code(lambda: clear("evt_c1", 1, ntid="ntx_nope")) == (
         404,
         "authorization_not_found",

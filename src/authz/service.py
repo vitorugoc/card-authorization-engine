@@ -12,7 +12,7 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
 from authz.db import pool
-from authz.models import AuthorizationRequest
+from authz.models import AuthorizationRequest, ClearingRequest, ReversalRequest
 from authz.policy import CardState, CompanyState, available, evaluate
 
 log = logging.getLogger("authz")
@@ -113,6 +113,24 @@ def _stored_response(conn: Conn, kind: str, key: str, req_hash: str) -> dict[str
     return response
 
 
+_UNIQUE_KEYS = {
+    "authorization": "authorizations_network_transaction_id_key",
+    "event": "authorization_events_event_id_key",
+}
+
+
+def _replay_after_race(
+    exc: errors.UniqueViolation, kind: str, key: str, req_hash: str
+) -> dict[str, Any]:
+    """The same id was committed meanwhile under ANOTHER company's lock; UNIQUE caught it."""
+    if exc.diag.constraint_name != _UNIQUE_KEYS[kind]:
+        raise exc
+    with pool().connection() as conn:
+        stored = _stored_response(conn, kind, key, req_hash)
+    assert stored is not None
+    return stored
+
+
 # --- authorization -------------------------------------------------------------------------
 
 
@@ -122,13 +140,7 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
     try:
         response = _authorize(req, req_hash)
     except errors.UniqueViolation as exc:
-        if exc.diag.constraint_name != "authorizations_network_transaction_id_key":
-            raise
-        # Same ntid committed meanwhile by a transaction holding ANOTHER company's lock.
-        with pool().connection() as conn:
-            stored = _stored_response(conn, "authorization", req.network_transaction_id, req_hash)
-        assert stored is not None
-        response = stored
+        response = _replay_after_race(exc, "authorization", req.network_transaction_id, req_hash)
     except OperationalError:
         # Lock/statement timeout, pool exhaustion, DB down: fail closed, inside the network
         # window. How generous to be on failure is stand-in config at the processor (ADR 0005).
@@ -208,6 +220,91 @@ def _response(
         "reasons": reasons,
         "available_credit_after": available_after,
     }
+
+
+# --- reversal & clearing (SDD §7.2, §7.3) --------------------------------------------------
+
+
+def reverse(ntid: str, req: ReversalRequest) -> dict[str, Any]:
+    """Release all (amount=None) or part of the remaining hold."""
+    return _apply_event(ntid, "reversal", req.event_id, req.amount)
+
+
+def clear(ntid: str, req: ClearingRequest) -> dict[str, Any]:
+    """Final settlement: post the amount, release the whole hold. Over-clear is posted."""
+    return _apply_event(ntid, "clearing", req.event_id, req.amount)
+
+
+def _apply_event(ntid: str, type_: str, event_id: str, amount: int | None) -> dict[str, Any]:
+    req_hash = request_hash({"ntid": ntid, "type": type_, "amount": amount})
+    try:
+        response = _apply_event_tx(ntid, type_, event_id, amount, req_hash)
+    except errors.UniqueViolation as exc:
+        return _replay_after_race(exc, "event", event_id, req_hash)
+    log.info("%s.applied %s", type_, response)
+    return response
+
+
+def _apply_event_tx(
+    ntid: str, type_: str, event_id: str, amount: int | None, req_hash: str
+) -> dict[str, Any]:
+    with pool().connection() as conn:
+        _begin(conn)
+        found = conn.execute(
+            "SELECT company_id FROM authorizations WHERE network_transaction_id = %s", (ntid,)
+        ).fetchone()
+        if found is None:
+            raise DomainError(404, "authorization_not_found")
+        locked = _lock_company(conn, found["company_id"])
+        stored = _stored_response(conn, "event", event_id, req_hash)
+        if stored is not None:
+            return stored
+
+        auth = conn.execute(
+            "SELECT id, amount, status, held_amount FROM authorizations"
+            " WHERE network_transaction_id = %s",
+            (ntid,),
+        ).fetchone()
+        assert auth is not None
+        if auth["status"] != "pending":
+            raise DomainError(409, "authorization_not_pending")
+
+        held: int = auth["held_amount"]
+        if type_ == "reversal":
+            applied = held if amount is None else amount
+            if applied > held:
+                raise DomainError(409, "amount_exceeds_hold")
+            new_held, cleared = held - applied, 0
+            status = "pending" if new_held else "reversed"
+        else:
+            assert amount is not None
+            applied, new_held, cleared, status = amount, 0, amount, "cleared"
+            if amount > held:
+                log.info("clearing.over_clear ntid=%s over_clear_delta=%d", ntid, amount - held)
+
+        conn.execute(
+            "UPDATE authorizations SET status = %s, held_amount = %s, cleared_amount = %s"
+            " WHERE id = %s",
+            (status, new_held, cleared, auth["id"]),
+        )
+        response = {
+            "authorization_id": auth["id"],
+            "network_transaction_id": ntid,
+            "event_id": event_id,
+            "type": type_,
+            "amount": applied,
+            "status": status,
+            "held_amount": new_held,
+            "cleared_amount": cleared,
+            "available_credit_after": available(_company_state(conn, locked)),
+        }
+        conn.execute(
+            """INSERT INTO authorization_events
+                 (id, event_id, authorization_id, type, amount, request_hash, response)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (_new_id("evt"), event_id, auth["id"], type_, applied, req_hash, Jsonb(response)),
+        )
+    return response
 
 
 # --- reads ---------------------------------------------------------------------------------
