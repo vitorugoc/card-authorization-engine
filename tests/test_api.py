@@ -53,3 +53,21 @@ def test_api_event_errors(card: str) -> None:
     assert (res.status_code, res.json()) == (404, {"error": "authorization_not_found"})
     res = client.post("/v1/authorizations/ntx_x/clearings", json={"event_id": "e1", "amount": 0})
     assert res.status_code == 422
+
+
+def test_openapi_documents_typed_response_contracts() -> None:
+    spec = client.get("/openapi.json").json()
+    schemas = spec["components"]["schemas"]
+
+    decision = schemas["AuthorizationResponse"]["properties"]["decision"]
+    assert decision["enum"] == ["approved", "declined"]
+    for name in ("EventResponse", "CompanyView", "CardView", "AuthorizationView", "ErrorResponse"):
+        assert name in schemas, name
+
+    auth_responses = spec["paths"]["/v1/authorizations"]["post"]["responses"]
+    assert auth_responses["200"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/AuthorizationResponse"
+    )
+    assert auth_responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorResponse"
+    )
