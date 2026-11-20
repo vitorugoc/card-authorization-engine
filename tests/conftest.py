@@ -75,3 +75,10 @@ def auth_request(
         "merchant_country": "US",
     }
     return AuthorizationRequest(**{**fields, **overrides})
+
+
+def client_post(client: Any, req: AuthorizationRequest) -> dict[str, Any]:
+    res = client.post("/v1/authorizations", json=req.model_dump())
+    assert res.status_code == 200, res.text
+    body: dict[str, Any] = res.json()
+    return body
