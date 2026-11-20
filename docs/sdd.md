@@ -1,6 +1,6 @@
 # SDD — Corporate Card Authorization Engine
 
-Status: approved (2026-11-20) · Source of decisions: [`grill-log.md`](grill-log.md) · ADRs: [`adr/`](adr/)
+Status: approved (2026-11-20) · implemented (see §16 for as-built notes) · Source of decisions: [`grill-log.md`](grill-log.md) · ADRs: [`adr/`](adr/)
 
 ## 1. Problem
 
@@ -234,17 +234,18 @@ The hash is `sha256` of canonical JSON (sorted keys) built from the decision-rel
 
 ## 8. Policy engine (`policy.py`, pure)
 
-- Inputs: frozen dataclasses `CardPolicy`, `CompanyState(currency, credit_limit, held, posted)`, `CardSpend(monthly)` and `AuthRequest`.
-- Each rule is a plain function `(…) -> str | None` that returns a decline code or None.
-- `evaluate()` runs every rule in precedence order. It returns `Decision(approved, decline_code=first, reasons=all, available_after)`.
-- No IO and no clock. The monthly window start is computed in the service and passed in.
+- Inputs: `amount`, `currency`, `mcc` and frozen dataclasses `CardState(status, per_txn_limit, monthly_limit, blocked_mccs, monthly_spend)` and `CompanyState(currency, credit_limit, held, posted)`.
+- The rules are one ordered tuple of `(decline_code, failed: bool)` pairs. The tuple order IS the precedence.
+- `evaluate()` collects every failing code. It returns `Decision(approved, decline_code=first, reasons=all, available_after)`.
+- No IO and no clock. `monthly_spend` is computed by the service in SQL (UTC month start) and passed in.
 
 ## 9. Code layout
 
 ```
+src/authz/models.py   pydantic request models: the trust boundary
 src/authz/policy.py   pure rules + evaluate + available()
 src/authz/service.py  transaction scripts: authorize, reverse, clear, freeze/update card
-src/authz/db.py       psycopg_pool + SQL functions; DATABASE_URL env
+src/authz/db.py       psycopg_pool; DATABASE_URL env (SQL lives next to its transaction in service.py)
 src/authz/api.py      FastAPI routes, pydantic models, status mapping, timing middleware
 src/authz/logging.py  ~15-line JSON formatter
 scripts/seed.py  scripts/demo.py
@@ -369,3 +370,18 @@ Demo seed (fixed IDs):
 - Both guarantees (§2) are covered by tests that fail if the lock or the idempotency check is removed.
 - README, WRITEUP.md (one page or less) and the 6 ADRs are present.
 - Git history shows red/green commits per phase.
+
+## 16. As-built notes
+
+Places where the implementation differs from the original plan:
+
+- **Policy rules** are a single ordered tuple of `(code, failed)` pairs, not one function per rule. It reads the same and is shorter.
+- **SQL lives in `service.py`**, next to the transaction it belongs to. `db.py` holds only the pool. Splitting the SQL out would have separated each lock from the queries it protects.
+- **`models.py` was added.** The pydantic request models are shared by the API, the service and the tests, and keeping them in `api.py` would have created an import cycle.
+- **Reversal and clearing timeouts return 503 `system_error`** instead of a 200 decline, so the processor retries. The retry is safe because events are idempotent by `event_id`.
+- **Property test** uses two cards that share one credit line, so either the card monthly limit or the company limit can be the one that binds. Its amount generator is biased towards exact limits and limit+1.
+- **The `X-Process-Time` header** reports end-to-end handler time. The `duration_ms` field in the decision log reports service time.
+- **Verified by mutation:**
+  - Removing `FOR UPDATE` makes both burst tests fail.
+  - Removing the UNIQUE-race handling makes the race tests fail.
+  - A `>`→`>=` change on the monthly limit or the credit check is caught by the unit boundary tests and by the property test.
