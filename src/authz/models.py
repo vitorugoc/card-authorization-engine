@@ -1,6 +1,6 @@
 """Request models: the trust boundary. Everything past here is validated."""
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
@@ -41,3 +41,13 @@ class ClearingRequest(BaseModel):
 
     event_id: Id
     amount: Amount  # may differ from the authorized amount (tips, fuel, FX movement)
+
+
+class CardPatch(BaseModel):
+    # Ops input: unknown fields are a client bug, not an evolving processor contract.
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["active", "frozen"] | None = None
+    per_txn_limit: Amount | None = None
+    monthly_limit: Amount | None = None
+    blocked_mccs: list[Mcc] | None = Field(default=None, max_length=100)

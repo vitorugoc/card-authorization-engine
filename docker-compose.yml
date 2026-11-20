@@ -17,6 +17,7 @@ services:
 
   app:
     build: .
+    command: uvicorn authz.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir src
     environment:
       DATABASE_URL: postgresql://authz:authz@db:5432/authz
       TEST_DATABASE_URL: postgresql://authz:authz@db:5432/authz_test

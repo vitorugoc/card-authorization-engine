@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 
 from authz import service
-from authz.models import AuthorizationRequest, ClearingRequest, ReversalRequest
+from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, ReversalRequest
 from authz.service import DomainError
 
 app = FastAPI(title="Card Authorization Engine")
@@ -66,3 +66,19 @@ def clear(network_transaction_id: str, req: ClearingRequest) -> dict[str, Any]:
 @app.get("/v1/companies/{company_id}")
 def get_company(company_id: str) -> dict[str, Any]:
     return service.get_company(company_id)
+
+
+@app.get("/v1/cards/{card_id}")
+def get_card(card_id: str) -> dict[str, Any]:
+    return service.get_card(card_id)
+
+
+@app.patch("/v1/cards/{card_id}")
+def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
+    # ponytail: unauthenticated for the local demo; first thing to lock down (WRITEUP).
+    return service.update_card(card_id, patch)
+
+
+@app.get("/v1/cards/{card_id}/authorizations")
+def list_card_authorizations(card_id: str) -> list[dict[str, Any]]:
+    return service.list_card_authorizations(card_id)

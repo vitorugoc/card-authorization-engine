@@ -1,0 +1,41 @@
+### Requests for the REST Client (VS Code) / JetBrains HTTP client. Run `make seed` first.
+@api = http://localhost:8000
+
+### Authorize (cross-border: merchant charged USD, network bills MXN)
+POST {{api}}/v1/authorizations
+Content-Type: application/json
+
+{
+  "network_transaction_id": "ntx_manual_1",
+  "card_id": "card_demo",
+  "amount": 12000, "currency": "MXN",
+  "merchant_amount": 700, "merchant_currency": "USD",
+  "mcc": "5812", "merchant_name": "Taqueria El Paso", "merchant_country": "US"
+}
+
+### Partial reversal (omit amount for full)
+POST {{api}}/v1/authorizations/ntx_manual_1/reversals
+Content-Type: application/json
+
+{"event_id": "evt_manual_r1", "amount": 2000}
+
+### Clearing (final; may exceed the hold)
+POST {{api}}/v1/authorizations/ntx_manual_1/clearings
+Content-Type: application/json
+
+{"event_id": "evt_manual_c1", "amount": 13800}
+
+### Company balances
+GET {{api}}/v1/companies/co_demo
+
+### Card + monthly spend
+GET {{api}}/v1/cards/card_demo
+
+### Card authorizations
+GET {{api}}/v1/cards/card_demo/authorizations
+
+### Freeze / unfreeze / change limits
+PATCH {{api}}/v1/cards/card_demo
+Content-Type: application/json
+
+{"status": "frozen"}

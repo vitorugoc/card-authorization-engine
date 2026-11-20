@@ -38,7 +38,7 @@ def test_patch_unknown_card_404() -> None:
     assert (res.status_code, res.json()) == (404, {"error": "card_not_found"})
 
 
-def test_get_card_includes_monthly_spend_and_no_holder_pii_leak(card: str) -> None:
+def test_get_card_includes_monthly_spend(card: str) -> None:
     client_post(client, auth_request(amount=12_000))
     body = client.get(f"/v1/cards/{card}").json()
     assert body["monthly_spend"] == 12_000

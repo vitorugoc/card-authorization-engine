@@ -7,12 +7,12 @@ import time
 import uuid
 from typing import Any
 
-from psycopg import Connection, OperationalError, errors
+from psycopg import Connection, OperationalError, errors, sql
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
 from authz.db import pool
-from authz.models import AuthorizationRequest, ClearingRequest, ReversalRequest
+from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, ReversalRequest
 from authz.policy import CardState, CompanyState, available, evaluate
 
 log = logging.getLogger("authz")
@@ -307,6 +307,30 @@ def _apply_event_tx(
     return response
 
 
+# --- card policy changes ----------------------------------------------------------------
+
+
+def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
+    """Takes the company lock like every money/policy write: no auth can see half a change."""
+    changes = patch.model_dump(exclude_none=True)
+    with pool().connection() as conn:
+        _begin(conn)
+        found = conn.execute("SELECT company_id FROM cards WHERE id = %s", (card_id,)).fetchone()
+        if found is None:
+            raise DomainError(404, "card_not_found")
+        _lock_company(conn, found["company_id"])
+        if changes:
+            assignments = sql.SQL(", ").join(
+                sql.SQL("{} = %s").format(sql.Identifier(column)) for column in changes
+            )
+            conn.execute(
+                sql.SQL("UPDATE cards SET {} WHERE id = %s").format(assignments),
+                (*changes.values(), card_id),
+            )
+    log.info("card.updated card_id=%s changes=%s", card_id, changes)
+    return get_card(card_id)
+
+
 # --- reads ---------------------------------------------------------------------------------
 
 
@@ -324,3 +348,30 @@ def get_company(company_id: str) -> dict[str, Any]:
         "posted": state.posted,
         "available": state.credit_limit - state.held - state.posted,
     }
+
+
+def get_card(card_id: str) -> dict[str, Any]:
+    with pool().connection() as conn:
+        row = conn.execute(
+            """SELECT id, company_id, holder_name, last4, status, per_txn_limit,
+                      monthly_limit, blocked_mccs
+               FROM cards WHERE id = %s""",
+            (card_id,),
+        ).fetchone()
+        if row is None:
+            raise DomainError(404, "card_not_found")
+        spend = _card_state(conn, card_id).monthly_spend
+    return {**row, "monthly_spend": spend}
+
+
+def list_card_authorizations(card_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    with pool().connection() as conn:
+        rows = conn.execute(
+            """SELECT id, network_transaction_id, amount, currency, merchant_amount,
+                      merchant_currency, mcc, merchant_name, merchant_country, status,
+                      decline_code, reasons, held_amount, cleared_amount, created_at
+               FROM authorizations WHERE card_id = %s
+               ORDER BY created_at DESC, id DESC LIMIT %s""",
+            (card_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]

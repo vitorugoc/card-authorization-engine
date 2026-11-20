@@ -1,6 +1,6 @@
 RUN = docker compose run --rm app
 
-.PHONY: up down reset test lint fmt seed demo logs
+.PHONY: up down reset test lint fmt seed demo demo-live logs
 
 up:     ## build and start db + api on :8000
 	docker compose up -d --build --wait
@@ -27,3 +27,6 @@ demo: seed
 
 logs:
 	docker compose logs -f app
+
+demo-live: seed  ## same demo, pauses for Enter between steps (for recording)
+	$(RUN) python scripts/demo.py --pause
