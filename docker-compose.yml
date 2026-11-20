@@ -26,6 +26,7 @@ services:
       - ./src:/app/src
       - ./tests:/app/tests
       - ./scripts:/app/scripts
+      - ./pyproject.toml:/app/pyproject.toml
     depends_on:
       db:
         condition: service_healthy

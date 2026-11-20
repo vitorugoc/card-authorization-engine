@@ -3,13 +3,13 @@ import os
 # Tests never touch the demo database.
 os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 
-from collections.abc import Iterable  # noqa: E402
-from typing import Any  # noqa: E402
+from collections.abc import Iterable
+from typing import Any
 
-import psycopg  # noqa: E402
-import pytest  # noqa: E402
+import psycopg
+import pytest
 
-from authz.models import AuthorizationRequest  # noqa: E402
+from authz.models import AuthorizationRequest
 
 TABLES = "authorization_events, authorizations, cards, companies"
 COMPANY = "co_test"
@@ -28,9 +28,7 @@ def sql(query: str, params: Iterable[Any] = ()) -> list[tuple[Any, ...]]:
         return cur.fetchall() if cur.description else []
 
 
-def insert_company(
-    id: str = COMPANY, credit_limit: int = 1_000_000, currency: str = "MXN"
-) -> str:
+def insert_company(id: str = COMPANY, credit_limit: int = 1_000_000, currency: str = "MXN") -> str:
     sql(
         "INSERT INTO companies (id, name, currency, credit_limit) VALUES (%s, %s, %s, %s)",
         (id, f"Company {id}", currency, credit_limit),
