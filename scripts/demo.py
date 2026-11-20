@@ -1,17 +1,29 @@
 """Narrated end-to-end demo against the running API. `--pause` waits for Enter between steps."""
 
+import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
+
+from authz.signature import sign
 
 API = os.environ.get("API_URL", "http://localhost:8000")
 PAUSE = "--pause" in sys.argv
 GREEN, RED, YELLOW, BOLD, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[0m"
 
 client = httpx.Client(base_url=API, timeout=5, limits=httpx.Limits(max_connections=20))
+
+
+def signed_post(path: str, payload: dict[str, Any]) -> httpx.Response:
+    """Processor webhooks are HMAC-signed; the engine rejects anything else with 401."""
+    body = json.dumps(payload).encode()
+    header = sign(os.environ["WEBHOOK_SECRET"], body, int(time.time()))
+    headers = {"Content-Type": "application/json", "X-Signature": header}
+    return client.post(path, content=body, headers=headers)
 
 
 def money(minor: int | None) -> str:
@@ -43,7 +55,7 @@ def auth(
     merchant_currency: str = "USD",
     show: bool = True,
 ) -> Any:
-    res = client.post("/v1/authorizations", json={
+    res = signed_post("/v1/authorizations", {
         "network_transaction_id": ntid, "card_id": "card_demo",
         "amount": amount, "currency": "MXN",
         "merchant_amount": merchant_amount, "merchant_currency": merchant_currency,
@@ -71,11 +83,15 @@ auth("ntx_casino", 60_000, mcc="7995", merchant="Lucky Casino", merchant_amount=
      merchant_currency="MXN")  # fmt: skip
 state()
 
-step(3, "Processor retries the lunch auth (network timeout) — then a tampered retry")
+step(3, "Processor retries the lunch auth (network timeout), then a tampered and a forged call")
 first = auth("ntx_lunch", 12_000, show=False).json()
 again = auth("ntx_lunch", 12_000, show=False).json()
 print(f"   same ntid, same payload: identical response = {again == first}, no new hold")
 auth("ntx_lunch", 99_000)
+forged = client.post("/v1/authorizations", json={"network_transaction_id": "ntx_forged"})
+print(
+    f"   forged request without a valid HMAC signature: HTTP {forged.status_code} {forged.json()}"
+)
 state()
 
 step(4, "Burst: 20 concurrent 100.00 auths, 880.00 left on the card this month")
@@ -91,13 +107,13 @@ state()
 
 step(5, "Partial reversal: restaurant releases 20.00 of the lunch hold")
 reversal = {"event_id": "evt_rev_1", "amount": 2_000}
-res = client.post("/v1/authorizations/ntx_lunch/reversals", json=reversal).json()
+res = signed_post("/v1/authorizations/ntx_lunch/reversals", reversal).json()
 print(f"   status {res['status']}, hold now {money(res['held_amount'])}")
 state()
 
 step(6, "Clearing arrives at 138.00 (tip added): posted in full, rest of hold released")
 clearing = {"event_id": "evt_clr_1", "amount": 13_800}
-res = client.post("/v1/authorizations/ntx_lunch/clearings", json=clearing).json()
+res = signed_post("/v1/authorizations/ntx_lunch/clearings", clearing).json()
 print(f"   status {res['status']}, posted {money(res['cleared_amount'])},"
       f" hold {money(res['held_amount'])}")  # fmt: skip
 state()

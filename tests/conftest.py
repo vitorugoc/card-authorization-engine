@@ -10,9 +10,9 @@ from typing import Any
 
 import psycopg
 import pytest
-from authz.signature import sign
 
 from authz.models import AuthorizationRequest
+from authz.signature import sign
 
 TABLES = "authorization_events, authorizations, cards, companies"
 COMPANY = "co_test"

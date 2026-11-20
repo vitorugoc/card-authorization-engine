@@ -1,11 +1,11 @@
 import json
 import time
 
-from authz.signature import sign
 from conftest import auth_request, signed_post
 from fastapi.testclient import TestClient
 
 from authz.api import app
+from authz.signature import sign
 
 client = TestClient(app)
 
@@ -112,3 +112,8 @@ def test_stale_signature_is_401(card: str) -> None:
 def test_signature_also_guards_reversals_and_clearings(card: str) -> None:
     for path in ("/v1/authorizations/ntx_1/reversals", "/v1/authorizations/ntx_1/clearings"):
         assert client.post(path, json={"event_id": "e1", "amount": 1}).status_code == 401
+
+
+def test_signature_is_checked_before_body_validation(card: str) -> None:
+    res = client.post("/v1/authorizations", json=payload(amount=120.5))
+    assert res.status_code == 401  # not 422: unsigned callers learn nothing about the schema

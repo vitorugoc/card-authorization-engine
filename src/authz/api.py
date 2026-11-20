@@ -1,15 +1,17 @@
 """HTTP layer: routing, validation (pydantic), status mapping. No business logic."""
 
+import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 
 from authz import logging as authz_logging
-from authz import service
+from authz import service, signature
 from authz.models import (
     AuthorizationRequest,
     AuthorizationResponse,
@@ -54,30 +56,51 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# --- processor-facing ----------------------------------------------------------------------
-
-
 def errors(*statuses: int) -> dict[int | str, dict[str, Any]]:
     return {status: {"model": ErrorResponse} for status in statuses}
 
 
-@app.post("/v1/authorizations", responses=errors(409))
+# --- processor-facing (signed webhooks) ----------------------------------------------------
+
+
+async def verified_webhook(request: Request, x_signature: Annotated[str, Header()] = "") -> None:
+    """Runs before body validation: an unsigned caller learns nothing about our schema."""
+    body = await request.body()  # raw bytes: the MAC is over exactly what was sent
+    if not signature.verify(os.environ["WEBHOOK_SECRET"], x_signature, body, now=time.time()):
+        logging.getLogger("authz").warning(
+            "webhook.invalid_signature", extra={"fields": {"path": request.url.path}}
+        )
+        raise DomainError(401, "invalid_signature")
+
+
+processor = APIRouter(dependencies=[Depends(verified_webhook)], responses=errors(401))
+
+
+@processor.post("/v1/authorizations", responses=errors(409))
 def authorize(req: AuthorizationRequest) -> AuthorizationResponse:
     """Approve or decline. A decline is a business outcome: HTTP 200 (ADR 0005)."""
     return AuthorizationResponse.model_validate(service.authorize(req))
 
 
-@app.post("/v1/authorizations/{network_transaction_id}/reversals", responses=errors(404, 409, 503))
+@processor.post(
+    "/v1/authorizations/{network_transaction_id}/reversals", responses=errors(404, 409, 503)
+)
 def reverse(network_transaction_id: str, req: ReversalRequest) -> EventResponse:
     return EventResponse.model_validate(service.reverse(network_transaction_id, req))
 
 
-@app.post("/v1/authorizations/{network_transaction_id}/clearings", responses=errors(404, 409, 503))
+@processor.post(
+    "/v1/authorizations/{network_transaction_id}/clearings", responses=errors(404, 409, 503)
+)
 def clear(network_transaction_id: str, req: ClearingRequest) -> EventResponse:
     return EventResponse.model_validate(service.clear(network_transaction_id, req))
 
 
-# --- ops -----------------------------------------------------------------------------------
+app.include_router(processor)
+
+
+# --- ops -------------------------------------------------------------------------------------
+# ponytail: unauthenticated for the local demo; first thing to lock down (WRITEUP).
 
 
 @app.get("/v1/companies/{company_id}", responses=errors(404))
