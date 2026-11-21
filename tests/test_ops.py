@@ -1,11 +1,58 @@
 """Ops surface: card reads and live policy changes (PATCH takes the company lock)."""
 
+import os
+import subprocess
+import sys
+
+import pytest
 from conftest import auth_request, client_post
 from fastapi.testclient import TestClient
+from psycopg import OperationalError
 
+from authz import service
 from authz.api import app
 
-client = TestClient(app)
+client = TestClient(app, headers={"Authorization": f"Bearer {os.environ['OPS_TOKEN']}"})
+anonymous = TestClient(app)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v1/companies/co_test"),
+        ("GET", "/v1/cards/card_test"),
+        ("GET", "/v1/cards/card_test/authorizations"),
+        ("PATCH", "/v1/cards/card_test"),
+    ],
+)
+@pytest.mark.parametrize("token", [None, "Bearer wrong", "ops_local_demo_only"])
+def test_ops_routes_require_bearer_token(
+    card: str, method: str, path: str, token: str | None
+) -> None:
+    headers = {"Authorization": token} if token else {}
+    res = anonymous.request(method, path, json={"status": "frozen"}, headers=headers)
+    assert (res.status_code, res.json()) == (401, {"error": "unauthorized"})
+    assert service.get_card(card)["status"] == "active"
+
+
+def test_app_refuses_to_start_without_required_config() -> None:
+    env = {k: v for k, v in os.environ.items() if k != "OPS_TOKEN"}
+    res = subprocess.run(
+        [sys.executable, "-c", "import authz.api"], env=env, capture_output=True, text=True
+    )
+    assert res.returncode != 0
+    assert "OPS_TOKEN must be set" in res.stderr
+
+
+def test_health_checks_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert anonymous.get("/health").json() == {"status": "ok"}
+
+    def down() -> None:
+        raise OperationalError("connection refused")
+
+    monkeypatch.setattr(service, "ping", down)
+    res = anonymous.get("/health")
+    assert (res.status_code, res.json()) == (503, {"error": "system_error"})
 
 
 def test_patch_freeze_then_auth_declines_card_inactive(card: str) -> None:
