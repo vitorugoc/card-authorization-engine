@@ -12,9 +12,9 @@ You only need Docker.
 ```bash
 make up      # build + start Postgres 16 and the API on :8000
 make demo    # reset demo data and run the narrated end-to-end demo
-make test    # 74 tests against a real Postgres (separate test database)
+make test    # 92 tests against a real Postgres (separate test database)
 make lint    # ruff + mypy --strict
-make loadtest  # latency/throughput: one hot company vs 16 (wipes demo data)
+make loadtest  # throughput: one hot company, 16 companies, hot + 500k history (wipes demo data)
 ```
 
 - If port 8000 is taken, run `API_PORT=8080 make up`. The demo runs inside the compose network, so it is unaffected.
@@ -40,14 +40,17 @@ make loadtest  # latency/throughput: one hot company vs 16 (wipes demo data)
 | POST | `/v1/authorizations` | Processor webhook (HMAC-signed). Always HTTP 200 with `decision` approved/declined; 409 `idempotency_mismatch`; 422 invalid |
 | POST | `/v1/authorizations/{ntid}/reversals` | `{event_id, amount?}` (no amount = full). 404 / 409 `authorization_not_pending` / 409 `amount_exceeds_hold` |
 | POST | `/v1/authorizations/{ntid}/clearings` | `{event_id, amount}`. Final; may exceed the hold (tips) |
-| GET | `/v1/companies/{id}` | `credit_limit`, `held`, `posted`, `available` |
-| GET | `/v1/cards/{id}` | Card policy plus `monthly_spend` |
-| GET | `/v1/cards/{id}/authorizations` | Newest first |
-| PATCH | `/v1/cards/{id}` | `status`, `per_txn_limit`, `monthly_limit`, `blocked_mccs` |
+| GET | `/v1/companies/{id}` | `credit_limit`, `held`, `posted`, `available` (ops) |
+| GET | `/v1/cards/{id}` | Card policy plus `monthly_spend` (ops) |
+| GET | `/v1/cards/{id}/authorizations` | Newest first (ops) |
+| PATCH | `/v1/cards/{id}` | `status`, `per_txn_limit`, `monthly_limit`, `blocked_mccs` (ops) |
+| GET | `/health` | `SELECT 1` through the pool; 503 if the database is unreachable |
 
 - Amounts are integers in minor units (`12000` = 120.00).
 - **The three processor routes require an `X-Signature: t=<unix>,v1=<hmac-sha256 hex>` header.** The HMAC is computed over `"<t>." + raw body` using `WEBHOOK_SECRET`, with a 5-minute tolerance. A missing or invalid signature gets 401, before the body is validated.
-- `requests.http` is unsigned, so use it for the ops routes; `scripts/demo.py` shows how to sign.
+- **Ops routes require `Authorization: Bearer <OPS_TOKEN>`** (`ops_local_demo_only` in `docker-compose.yml`), otherwise they return 401 `unauthorized`.
+- The app refuses to boot if `WEBHOOK_SECRET`, `OPS_TOKEN` or `DATABASE_URL` is missing.
+- `requests.http` is unsigned, so use it for the ops routes (it carries the bearer token); `scripts/demo.py` shows how to sign.
 - Example payloads are in [`requests.http`](requests.http). OpenAPI docs, with typed response and error schemas, are at `http://localhost:8000/docs`.
 
 Decline codes, in precedence order: `card_not_found`, `card_inactive`, `currency_mismatch`, `mcc_blocked`,
@@ -57,14 +60,16 @@ Decline codes, in precedence order: `card_not_found`, `card_inactive`, `currency
 
 `make loadtest` sends 2,000 signed authorizations per scenario. It was run on an Apple M3 Pro with Docker, a single uvicorn process, and client and server on the same machine.
 
-| Scenario | Concurrent clients | Throughput | Server p99 | Client p99 | `system_error` |
-|----------|-------------------:|-----------:|-----------:|-----------:|---------------:|
-| hot: 1 company | 16 | ~240 req/s | ~55 ms | ~100 ms | 0 |
-| hot: 1 company | 64 | ~240 req/s | ~300 ms | ~340 ms | 0 |
-| spread: 16 companies | 16 | ~320 req/s | ~18 ms | ~60 ms | 0 |
-| spread: 16 companies | 64 | ~750 req/s | ~80 ms | ~120 ms | 0 |
+| Scenario | Concurrent clients | Throughput | Server p99 | `system_error` |
+|----------|-------------------:|-----------:|-----------:|---------------:|
+| hot: 1 company | 16 | ~300 req/s | ~45 ms | 0 |
+| hot: 1 company | 64 | ~380 req/s | ~170 ms | 0 |
+| spread: 16 companies | 64 | ~750 req/s | ~80 ms | 0 |
+| history: hot + 500k settled clearings | 16 | ~310 req/s | ~45 ms | 0 |
+| history, **before** the posted counter | 16 | 59 req/s | ~280 ms | **909 / 2000** |
 
-A single company tops out at about 240 authorizations per second whatever the concurrency, because each one holds that company's row lock for about 4 ms. More clients only add queueing time. Spread across companies, the locks rarely collide and throughput grows with concurrency. This is the per-company ceiling described in [ADR 0002](docs/adr/0002-per-company-row-lock.md), now measured.
+- **One company is serialized by its row lock** ([ADR 0002](docs/adr/0002-per-company-row-lock.md)). Each authorization holds the lock for about 3 ms, so more clients mostly add queueing time. Spread across companies, the locks rarely collide and throughput grows with concurrency.
+- **The history scenario changed a design decision.** At first, balances were derived by summing every past clearing under the lock. With a year of history, that sum took about 27 ms, and authorizations started failing closed on the 200 ms lock timeout. Posted spend is now a running total, updated in the same transaction and under the same lock, and reconciled by the property test ([ADR 0004](docs/adr/0004-derived-balances-no-ledger.md)).
 
 ## Layout
 
@@ -85,7 +90,7 @@ docs/          sdd.md (spec), adr/ (6 decisions), grill-log.md (how the design w
 
 ## Tests
 
-- `test_concurrency.py` fires bursts released by a barrier and asserts exact approval counts. It fails if `FOR UPDATE` is removed (verified).
+- `test_concurrency.py` fires bursts released by a barrier and asserts exact approval counts. It also races clearings against each other and against a reversal, and commits a card freeze while an authorization waits on the lock. These tests fail if `FOR UPDATE` is removed or the card is read before the lock (verified).
 - `test_idempotency.py` includes a real cross-company race on the same transaction id, which is resolved by the UNIQUE constraint.
 - `test_properties.py` runs Hypothesis model-based tests: random auth/reverse/clear sequences must match a reference model.
 

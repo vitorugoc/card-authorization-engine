@@ -138,6 +138,7 @@ CREATE TABLE companies (
   name          text NOT NULL,
   currency      char(3) NOT NULL,
   credit_limit  bigint NOT NULL CHECK (credit_limit >= 0),
+  posted        bigint NOT NULL DEFAULT 0 CHECK (posted >= 0),  -- running total (ADR 0004)
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 
@@ -177,7 +178,8 @@ CREATE TABLE authorizations (
   CHECK (status = 'pending' OR held_amount = 0),
   CHECK (cleared_amount = 0 OR status = 'cleared')
 );
-CREATE INDEX authorizations_company_open ON authorizations (company_id) WHERE status IN ('pending','cleared');
+CREATE INDEX authorizations_company_pending ON authorizations (company_id) INCLUDE (held_amount)
+  WHERE status = 'pending';
 CREATE INDEX authorizations_card_created ON authorizations (card_id, created_at);
 
 CREATE TABLE authorization_events (
@@ -207,7 +209,7 @@ BEGIN
   existing  ← SELECT request_hash, response FROM authorizations WHERE network_transaction_id = :ntid
   if existing: return existing.response if hash matches else raise IdempotencyMismatch (409)
   card      ← SELECT … FROM cards WHERE id = :card_id                   -- re-read after lock (no TOCTOU)
-  totals    ← company held/posted SUMs; card monthly spend SUM
+  totals    ← held SUM over pending holds + companies.posted counter; card monthly spend SUM
   decision  ← policy.evaluate(card, company, totals, request)           -- pure
   INSERT authorization (status pending|declined, held = amount|0, policy_snapshot, request_hash, response)
 COMMIT
@@ -266,7 +268,8 @@ There are no interfaces, repositories or rule registries. Each module has one im
 - **Input.** Strict validation at the boundary (§5) and parameterized SQL only.
 - **Card data.** No PAN, CVV or expiry is stored. `card_id` is the processor token, and only `last4` is kept.
 - **Errors.** `system_error` responses are generic and expose no internals.
-- **Out of scope (named in the write-up):** authentication on the ops routes (PATCH is the first thing to lock down), TLS, rate limiting and secrets management.
+- **Authentication.** Processor routes require an HMAC signature. Ops routes require a shared bearer token (`OPS_TOKEN`). Required secrets are checked at boot.
+- **Out of scope (named in the write-up):** per-user ops identity and audit (SSO), TLS, rate limiting and secrets management.
 
 ## 12. Test strategy
 
@@ -360,9 +363,9 @@ Demo seed (fixed IDs):
 ## 14. Known limits and next steps
 
 - **Per-company hot row.** All authorizations for one company are serialized. Upgrade path: per-card locks plus a company reservation counter, or sharded balances.
-- **SUM cost grows with history.** Upgrade path: materialized running balances maintained by a ledger.
+- **Posted is a denormalized counter** (ADR 0004). It is safe while clearings are its only writer. Repayments would add a second writer, and that is the point to move to a ledger.
 - **Model gaps:** no double-entry ledger, hold expiry, multi-clearing, force-post or late clearing after reversal, and no company timezone for the monthly window.
-- **Production hardening:** ops authentication, stand-in reconciliation, Prometheus metrics.
+- **Production hardening:** per-user ops identity, stand-in reconciliation, Prometheus metrics.
 
 ## 15. Definition of done
 
@@ -392,3 +395,13 @@ Places where the implementation differs from the original plan:
   - **Event replays compare the resolved amount.** An omitted reversal amount means "the whole remaining hold", so it matches an explicit amount that released everything.
   - **`make loadtest`** produces the measured numbers in README → Performance.
   - **CI** (`.github/workflows/ci.yml`) runs lint, test and the demo.
+- **Added after the second review (2026-11-20):**
+  - **Posted became a running counter on `companies`** (ADR 0004, amended). The loadtest `history` scenario (500k settled clearings) showed that derived balances fell to 59 req/s with 909/2000 `system_error`. After the change, the same scenario runs at about 310 req/s with zero errors. The property test reconciles the counter against `SUM(cleared_amount)` after every step.
+  - **Concurrency tests for events and TOCTOU:**
+    - 10 concurrent clearings settle once;
+    - a reversal racing a clearing has exactly one winner;
+    - a freeze committed while an authorization waits on the lock is honoured.
+    Mutation-checked: removing `FOR UPDATE` or reading the card before the lock fails them.
+  - **Bearer token on ops routes** (`OPS_TOKEN`, constant-time compare).
+  - **Fail-fast config:** missing secrets stop the boot.
+  - **`/health` checks the database** and returns 503 when it is unreachable.
