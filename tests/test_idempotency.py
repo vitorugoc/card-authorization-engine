@@ -74,7 +74,14 @@ def test_cross_company_ntid_race_resolved_by_unique_constraint(
     insert_company("co_other")
     insert_card("card_other", company_id="co_other")
     req = auth_request()
-    racer_response = {"authorization_id": "auth_racer", "decision": "approved"}
+    racer_response: dict[str, object] = {
+        "authorization_id": "auth_racer",
+        "network_transaction_id": "ntx_1",
+        "decision": "approved",
+        "decline_code": None,
+        "reasons": [],
+        "available_credit_after": 900,
+    }
     racer_hash = idempotency.request_hash(req.decision_fields()) if same_payload else "different"
 
     racer = threading.Thread(target=_insert_in_open_transaction, args=(racer_hash, racer_response))
@@ -82,7 +89,7 @@ def test_cross_company_ntid_race_resolved_by_unique_constraint(
     time.sleep(0.03)  # racer's row is inserted but not committed yet
     try:
         if same_payload:
-            assert service.authorize(req) == racer_response
+            assert service.authorize(req).model_dump(mode="json") == racer_response
         else:
             with pytest.raises(DomainError) as exc:
                 service.authorize(req)

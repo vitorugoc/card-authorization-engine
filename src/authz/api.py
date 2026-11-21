@@ -112,21 +112,21 @@ processor = APIRouter(dependencies=[Depends(verified_webhook)], responses=errors
 @processor.post("/v1/authorizations", responses=errors(409))
 def authorize(req: AuthorizationRequest) -> AuthorizationResponse:
     """Approve or decline. A decline is a business outcome: HTTP 200 (ADR 0005)."""
-    return AuthorizationResponse.model_validate(service.authorize(req))
+    return service.authorize(req)
 
 
 @processor.post(
     "/v1/authorizations/{network_transaction_id}/reversals", responses=errors(404, 409, 503)
 )
 def reverse(network_transaction_id: str, req: ReversalRequest) -> EventResponse:
-    return EventResponse.model_validate(service.reverse(network_transaction_id, req))
+    return service.reverse(network_transaction_id, req)
 
 
 @processor.post(
     "/v1/authorizations/{network_transaction_id}/clearings", responses=errors(404, 409, 503)
 )
 def clear(network_transaction_id: str, req: ClearingRequest) -> EventResponse:
-    return EventResponse.model_validate(service.clear(network_transaction_id, req))
+    return service.clear(network_transaction_id, req)
 
 
 app.include_router(processor)
@@ -147,22 +147,22 @@ ops = APIRouter(dependencies=[Depends(ops_token)], responses=errors(401))
 
 @ops.get("/v1/companies/{company_id}", responses=errors(404))
 def get_company(company_id: str) -> CompanyView:
-    return CompanyView.model_validate(service.get_company(company_id))
+    return service.get_company(company_id)
 
 
 @ops.get("/v1/cards/{card_id}", responses=errors(404))
 def get_card(card_id: str) -> CardView:
-    return CardView.model_validate(service.get_card(card_id))
+    return service.get_card(card_id)
 
 
 @ops.patch("/v1/cards/{card_id}", responses=errors(404))
 def update_card(card_id: str, patch: CardPatch) -> CardView:
-    return CardView.model_validate(service.update_card(card_id, patch))
+    return service.update_card(card_id, patch)
 
 
 @ops.get("/v1/cards/{card_id}/authorizations")
 def list_card_authorizations(card_id: str) -> list[AuthorizationView]:
-    return [AuthorizationView.model_validate(r) for r in service.list_card_authorizations(card_id)]
+    return service.list_card_authorizations(card_id)
 
 
 app.include_router(ops)

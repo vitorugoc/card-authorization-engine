@@ -4,10 +4,11 @@ from dataclasses import replace
 
 import pytest
 
+from authz.domain import CardStatus
 from authz.policy import CardState, CompanyState, available, evaluate
 
 CARD = CardState(
-    status="active",
+    status=CardStatus.ACTIVE,
     per_txn_limit=50_000,
     monthly_limit=100_000,
     blocked_mccs=frozenset({"7995"}),
@@ -36,7 +37,7 @@ def test_approves_clean_request() -> None:
 
 
 def test_frozen_card_declines() -> None:
-    assert decide(card=replace(CARD, status="frozen"))[1] == "card_inactive"
+    assert decide(card=replace(CARD, status=CardStatus.FROZEN))[1] == "card_inactive"
 
 
 def test_currency_mismatch_declines() -> None:
@@ -68,7 +69,7 @@ def test_company_credit_boundary(amount: int, approved: bool) -> None:
 
 
 def test_all_failing_reasons_returned_in_precedence_order() -> None:
-    card = replace(CARD, status="frozen", monthly_spend=100_000)
+    card = replace(CARD, status=CardStatus.FROZEN, monthly_spend=100_000)
     company = replace(COMPANY, credit_limit=0)
     _, code, reasons = decide(amount=60_000, currency="USD", mcc="7995", card=card, company=company)
     assert code == "card_inactive"

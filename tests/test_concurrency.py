@@ -8,7 +8,6 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
 
 import psycopg
 from conftest import COMPANY, auth_request, insert_card, insert_company, sql
@@ -18,11 +17,11 @@ from authz.domain import DomainError
 from authz.models import ClearingRequest, ReversalRequest
 
 
-def burst(n: int, call: Callable[[int], dict[str, Any]]) -> list[dict[str, Any]]:
+def burst[T](n: int, call: Callable[[int], T]) -> list[T]:
     """Run n calls released at the same instant by a barrier."""
     barrier = threading.Barrier(n)
 
-    def run(i: int) -> dict[str, Any]:
+    def run(i: int) -> T:
         barrier.wait()
         return call(i)
 
@@ -32,7 +31,7 @@ def burst(n: int, call: Callable[[int], dict[str, Any]]) -> list[dict[str, Any]]
 
 def assert_invariants() -> None:
     company = service.get_company(COMPANY)
-    assert company["held"] + company["posted"] <= company["credit_limit"]
+    assert company.held + company.posted <= company.credit_limit
     [(card_spend_ok,)] = sql(
         """SELECT bool_and(spend <= monthly_limit) FROM (
              SELECT c.monthly_limit, COALESCE(SUM(a.held_amount + a.cleared_amount), 0) AS spend
@@ -47,8 +46,8 @@ def test_burst_20x100_with_880_remaining_approves_exactly_8(card: str) -> None:
 
     results = burst(20, lambda i: service.authorize(auth_request(f"ntx_{i}", amount=10_000)))
 
-    assert sum(r["decision"] == "approved" for r in results) == 8
-    assert {r["decline_code"] for r in results} == {None, "exceeds_card_monthly_limit"}
+    assert sum(r.decision == "approved" for r in results) == 8
+    assert {r.decline_code for r in results} == {None, "exceeds_card_monthly_limit"}
     assert_invariants()
 
 
@@ -61,8 +60,8 @@ def test_company_credit_shared_across_cards_never_overspent() -> None:
         lambda i: service.authorize(auth_request(f"ntx_{i}", card_id=cards[i % 4], amount=10_000)),
     )
 
-    assert sum(r["decision"] == "approved" for r in results) == 5
-    assert service.get_company(COMPANY)["available"] == 0
+    assert sum(r.decision == "approved" for r in results) == 5
+    assert service.get_company(COMPANY).available == 0
     assert_invariants()
 
 
@@ -81,9 +80,9 @@ def test_lock_timeout_fails_closed_with_system_error(card: str) -> None:
         res = service.authorize(auth_request())
         elapsed = time.perf_counter() - started
 
-    assert res["decision"] == "declined"
-    assert res["decline_code"] == "system_error"
-    assert res["authorization_id"] is None
+    assert res.decision == "declined"
+    assert res.decline_code == "system_error"
+    assert res.authorization_id is None
     assert elapsed < 1.0
     assert sql("SELECT count(*) FROM authorizations") == [(0,)]
 
@@ -99,16 +98,12 @@ def outcome(call: Callable[[], object]) -> str:
 def test_concurrent_clearings_with_distinct_event_ids_settle_once(card: str) -> None:
     service.authorize(auth_request("ntx_1", amount=12_000))
 
-    results = burst(
-        10,
-        lambda i: {
-            "r": outcome(
-                lambda: service.clear("ntx_1", ClearingRequest(event_id=f"evt_{i}", amount=12_000))
-            )
-        },
-    )
+    def settle(i: int) -> str:
+        return outcome(
+            lambda: service.clear("ntx_1", ClearingRequest(event_id=f"evt_{i}", amount=12_000))
+        )
 
-    assert sorted(r["r"] for r in results) == ["authorization_not_pending"] * 9 + ["ok"]
+    assert sorted(burst(10, settle)) == ["authorization_not_pending"] * 9 + ["ok"]
     assert sql("SELECT posted FROM companies") == [(12_000,)]
     assert sql("SELECT count(*) FROM authorization_events") == [(1,)]
 
@@ -120,9 +115,7 @@ def test_concurrent_reversal_and_clearing_exactly_one_wins(card: str) -> None:
         lambda: service.clear("ntx_1", ClearingRequest(event_id="evt_c", amount=11_000)),
     ]
 
-    results = burst(2, lambda i: {"r": outcome(calls[i])})
-
-    assert sorted(r["r"] for r in results) == ["authorization_not_pending", "ok"]
+    assert sorted(burst(2, lambda i: outcome(calls[i]))) == ["authorization_not_pending", "ok"]
     [(status, held, cleared)] = sql(
         "SELECT status, held_amount, cleared_amount FROM authorizations"
     )
@@ -145,4 +138,4 @@ def test_freeze_committed_while_auth_waits_for_the_lock_is_honoured(card: str) -
             ops.commit()
             res = pending.result()
 
-    assert res["decline_code"] == "card_inactive"
+    assert res.decline_code == "card_inactive"

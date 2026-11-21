@@ -3,7 +3,6 @@
 import logging
 import time
 import uuid
-from typing import Any
 
 from psycopg import OperationalError, errors, sql
 from psycopg.rows import DictRow
@@ -21,7 +20,17 @@ from authz.domain import (
     NotFound,
     Outcome,
 )
-from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, ReversalRequest
+from authz.models import (
+    AuthorizationRequest,
+    AuthorizationResponse,
+    AuthorizationView,
+    CardPatch,
+    CardView,
+    ClearingRequest,
+    CompanyView,
+    EventResponse,
+    ReversalRequest,
+)
 from authz.policy import CardState, CompanyState, available, evaluate
 
 log = logging.getLogger("authz")
@@ -94,16 +103,16 @@ def _card_state(conn: Conn, card_id: str) -> CardState:
 # --- authorization -------------------------------------------------------------------------
 
 
-def authorize(req: AuthorizationRequest) -> dict[str, Any]:
+def authorize(req: AuthorizationRequest) -> AuthorizationResponse:
     started = time.perf_counter()
     req_hash = idempotency.request_hash(req.decision_fields())
     try:
         response, replay = _authorize(req, req_hash)
     except errors.UniqueViolation as exc:
-        response = idempotency.replay_after_race(
+        stored = idempotency.replay_after_race(
             exc, "authorization", req.network_transaction_id, idempotency.same_hash(req_hash)
         )
-        replay = True
+        response, replay = AuthorizationResponse.model_validate(stored), True
     except OperationalError:
         # Lock/statement timeout, pool exhaustion, DB down: fail closed, inside the network
         # window. How generous to be on failure is stand-in config at the processor (ADR 0005).
@@ -115,7 +124,7 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
         return _response(None, req, Outcome.DECLINED, code, [code], None)
     # Never log holder_name: the only PII we hold.
     fields = {
-        **response,
+        **response.model_dump(mode="json"),
         **req.decision_fields(),
         "replay": replay,
         "duration_ms": round((time.perf_counter() - started) * 1000, 1),
@@ -124,7 +133,7 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
     return response
 
 
-def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any], bool]:
+def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[AuthorizationResponse, bool]:
     """Returns (response, replay)."""
     with pool().connection() as conn:
         _begin(conn)
@@ -140,7 +149,7 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
             conn, "authorization", req.network_transaction_id, idempotency.same_hash(req_hash)
         )
         if stored is not None:
-            return stored, True
+            return AuthorizationResponse.model_validate(stored), True
         company = _company_state(conn, card["company_id"])
         # Re-read the card under the lock: a concurrent freeze/limit change can't race us.
         card_state = _card_state(conn, req.card_id)
@@ -177,7 +186,7 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
                 req.mcc, req.merchant_name, req.merchant_country,
                 status, decision.decline_code, list(decision.reasons),
                 req.amount if decision.approved else 0,
-                Jsonb(snapshot), req_hash, Jsonb(response),
+                Jsonb(snapshot), req_hash, Jsonb(response.model_dump(mode="json")),
             ),
         )  # fmt: skip
     return response, False
@@ -190,44 +199,45 @@ def _response(
     decline_code: DeclineCode | None,
     reasons: list[DeclineCode],
     available_after: int | None,
-) -> dict[str, Any]:
-    return {
-        "authorization_id": auth_id,
-        "network_transaction_id": req.network_transaction_id,
-        "decision": decision,
-        "decline_code": decline_code,
-        "reasons": reasons,
-        "available_credit_after": available_after,
-    }
+) -> AuthorizationResponse:
+    return AuthorizationResponse(
+        authorization_id=auth_id,
+        network_transaction_id=req.network_transaction_id,
+        decision=decision,
+        decline_code=decline_code,
+        reasons=reasons,
+        available_credit_after=available_after,
+    )
 
 
 # --- reversal & clearing (SDD §7.2, §7.3) --------------------------------------------------
 
 
-def reverse(ntid: str, req: ReversalRequest) -> dict[str, Any]:
+def reverse(ntid: str, req: ReversalRequest) -> EventResponse:
     """Release all (amount=None) or part of the remaining hold."""
     return _apply_event(ntid, EventType.REVERSAL, req.event_id, req.amount)
 
 
-def clear(ntid: str, req: ClearingRequest) -> dict[str, Any]:
+def clear(ntid: str, req: ClearingRequest) -> EventResponse:
     """Final settlement: post the amount, release the whole hold. Over-clear is posted."""
     return _apply_event(ntid, EventType.CLEARING, req.event_id, req.amount)
 
 
-def _apply_event(ntid: str, type_: EventType, event_id: str, amount: int | None) -> dict[str, Any]:
+def _apply_event(ntid: str, type_: EventType, event_id: str, amount: int | None) -> EventResponse:
     try:
         response = _apply_event_tx(ntid, type_, event_id, amount)
     except errors.UniqueViolation as exc:
-        return idempotency.replay_after_race(
+        stored = idempotency.replay_after_race(
             exc, "event", event_id, idempotency.same_event(ntid, type_, amount)
         )
-    log.info(f"{type_}.applied", extra={"fields": response})
+        return EventResponse.model_validate(stored)
+    log.info(f"{type_}.applied", extra={"fields": response.model_dump(mode="json")})
     return response
 
 
 def _apply_event_tx(
     ntid: str, type_: EventType, event_id: str, amount: int | None
-) -> dict[str, Any]:
+) -> EventResponse:
     with pool().connection() as conn:
         _begin(conn)
         found = conn.execute(
@@ -241,7 +251,7 @@ def _apply_event_tx(
             conn, "event", event_id, idempotency.same_event(ntid, type_, amount)
         )
         if stored is not None:
-            return stored
+            return EventResponse.model_validate(stored)
 
         auth = conn.execute(
             "SELECT id, amount, status, held_amount FROM authorizations"
@@ -277,17 +287,18 @@ def _apply_event_tx(
             conn.execute(
                 "UPDATE companies SET posted = posted + %s WHERE id = %s", (cleared, company_id)
             )
-        response = {
-            "authorization_id": auth["id"],
-            "network_transaction_id": ntid,
-            "event_id": event_id,
-            "type": type_,
-            "amount": applied,
-            "status": status,
-            "held_amount": new_held,
-            "cleared_amount": cleared,
-            "available_credit_after": available(_company_state(conn, company_id)),
-        }
+        response = EventResponse(
+            authorization_id=auth["id"],
+            network_transaction_id=ntid,
+            event_id=event_id,
+            type=type_,
+            amount=applied,
+            status=status,
+            held_amount=new_held,
+            cleared_amount=cleared,
+            available_credit_after=available(_company_state(conn, company_id)),
+        )
+        resolved = idempotency.request_hash({"ntid": ntid, "type": type_, "amount": applied})
         conn.execute(
             """INSERT INTO authorization_events
                  (id, event_id, authorization_id, type, amount, request_hash, response)
@@ -298,10 +309,8 @@ def _apply_event_tx(
                 auth["id"],
                 type_,
                 applied,
-                idempotency.request_hash(
-                    {"ntid": ntid, "type": type_, "amount": applied}
-                ),  # resolved
-                Jsonb(response),
+                resolved,
+                Jsonb(response.model_dump(mode="json")),
             ),
         )
     return response
@@ -310,7 +319,7 @@ def _apply_event_tx(
 # --- card policy changes ----------------------------------------------------------------
 
 
-def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
+def update_card(card_id: str, patch: CardPatch) -> CardView:
     """Takes the company lock like every money/policy write: no auth can see half a change."""
     changes = patch.model_dump(exclude_none=True)
     with pool().connection() as conn:
@@ -339,23 +348,24 @@ def ping() -> None:
         conn.execute("SELECT 1")
 
 
-def get_company(company_id: str) -> dict[str, Any]:
+def get_company(company_id: str) -> CompanyView:
     with pool().connection() as conn:
         row = conn.execute("SELECT id, name FROM companies WHERE id = %s", (company_id,)).fetchone()
         if row is None:
             raise NotFound(ErrorCode.COMPANY_NOT_FOUND)
         state = _company_state(conn, company_id)
-    return {
-        **row,
-        "currency": state.currency,
-        "credit_limit": state.credit_limit,
-        "held": state.held,
-        "posted": state.posted,
-        "available": available(state),
-    }
+    return CompanyView(
+        id=row["id"],
+        name=row["name"],
+        currency=state.currency,
+        credit_limit=state.credit_limit,
+        held=state.held,
+        posted=state.posted,
+        available=available(state),
+    )
 
 
-def get_card(card_id: str) -> dict[str, Any]:
+def get_card(card_id: str) -> CardView:
     with pool().connection() as conn:
         row = conn.execute(
             """SELECT id, company_id, holder_name, last4, status, per_txn_limit,
@@ -366,10 +376,10 @@ def get_card(card_id: str) -> dict[str, Any]:
         if row is None:
             raise NotFound(ErrorCode.CARD_NOT_FOUND)
         spend = _card_state(conn, card_id).monthly_spend
-    return {**row, "monthly_spend": spend}
+    return CardView.model_validate({**row, "monthly_spend": spend})
 
 
-def list_card_authorizations(card_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def list_card_authorizations(card_id: str, limit: int = 50) -> list[AuthorizationView]:
     with pool().connection() as conn:
         rows = conn.execute(
             """SELECT id, network_transaction_id, amount, currency, merchant_amount,
@@ -379,4 +389,4 @@ def list_card_authorizations(card_id: str, limit: int = 50) -> list[dict[str, An
                ORDER BY created_at DESC, id DESC LIMIT %s""",
             (card_id, limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [AuthorizationView.model_validate(r) for r in rows]

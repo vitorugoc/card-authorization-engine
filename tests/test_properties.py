@@ -53,15 +53,15 @@ def test_random_lifecycle_matches_reference_model(data: st.DataObject) -> None:
                 amount <= PER_TXN and card_used + amount <= MONTHLY and amount <= LIMIT - used
             )
             res = service.authorize(auth_request(f"ntx_{step}", card_id=card, amount=amount))
-            assert (res["decision"] == "approved") is expected, (amount, card_used, used, res)
+            assert (res.decision == "approved") is expected, (amount, card_used, used, res)
             if expected:
                 model.append(Auth(f"ntx_{step}", card, held=amount))
 
         elif op == "reverse":
             a = data.draw(st.sampled_from(pending), label="auth")
-            amount = data.draw(st.none() | st.integers(1, a.held), label="reversal")
-            service.reverse(a.ntid, ReversalRequest(event_id=f"evt_{step}", amount=amount))
-            a.held -= a.held if amount is None else amount
+            release = data.draw(st.none() | st.integers(1, a.held), label="reversal")
+            service.reverse(a.ntid, ReversalRequest(event_id=f"evt_{step}", amount=release))
+            a.held -= a.held if release is None else release
             a.status = "pending" if a.held else "reversed"
 
         else:
@@ -71,9 +71,9 @@ def test_random_lifecycle_matches_reference_model(data: st.DataObject) -> None:
             a.held, a.cleared, a.status = 0, amount, "cleared"
 
         company = service.get_company(COMPANY)
-        assert company["held"] == sum(a.held for a in model)
-        assert company["posted"] == sum(a.cleared for a in model)
-        assert 0 <= company["held"] + company["posted"] <= LIMIT
+        assert company.held == sum(a.held for a in model)
+        assert company.posted == sum(a.cleared for a in model)
+        assert 0 <= company.held + company.posted <= LIMIT
         # Reconciliation: the running counter always equals the history it summarizes.
         assert sql("SELECT posted FROM companies") == sql(
             "SELECT COALESCE(SUM(cleared_amount), 0) FROM authorizations"

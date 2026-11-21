@@ -32,7 +32,7 @@ def test_ops_routes_require_bearer_token(
     headers = {"Authorization": token} if token else {}
     res = anonymous.request(method, path, json={"status": "frozen"}, headers=headers)
     assert (res.status_code, res.json()) == (401, {"error": "unauthorized"})
-    assert service.get_card(card)["status"] == "active"
+    assert service.get_card(card).status == "active"
 
 
 def test_app_refuses_to_start_without_required_config() -> None:
