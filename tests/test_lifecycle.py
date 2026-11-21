@@ -6,8 +6,8 @@ import pytest
 from conftest import COMPANY, auth_request, sql
 
 from authz import service
+from authz.domain import Conflict, DomainError, NotFound
 from authz.models import ClearingRequest, ReversalRequest
-from authz.service import DomainError
 
 
 def approve(ntid: str = "ntx_1", amount: int = 12_000) -> None:
@@ -27,10 +27,10 @@ def auth_row() -> tuple[str, int, int]:
     return row  # type: ignore[return-value]
 
 
-def error_code(call: Any) -> tuple[int, str]:
+def error_code(call: Any) -> tuple[type[DomainError], str]:
     with pytest.raises(DomainError) as exc:
         call()
-    return exc.value.status, exc.value.code
+    return type(exc.value), exc.value.code
 
 
 def test_partial_reversal_reduces_hold(card: str) -> None:
@@ -53,9 +53,9 @@ def test_full_reversal_without_amount_sets_reversed(card: str) -> None:
     assert service.get_company(COMPANY)["available"] == 1_000_000
 
 
-def test_reversal_exceeding_hold_409(card: str) -> None:
+def test_reversal_exceeding_hold_conflict(card: str) -> None:
     approve(amount=12_000)
-    assert error_code(lambda: reverse("evt_r1", amount=12_001)) == (409, "amount_exceeds_hold")
+    assert error_code(lambda: reverse("evt_r1", amount=12_001)) == (Conflict, "amount_exceeds_hold")
     assert auth_row() == ("pending", 12_000, 0)
 
 
@@ -90,30 +90,30 @@ def test_over_clear_posts_full_amount_even_past_the_limit() -> None:
     assert service.get_company(COMPANY)["available"] == -3_000
 
 
-def test_clearing_on_reversed_409(card: str) -> None:
+def test_clearing_on_reversed_conflict(card: str) -> None:
     approve()
     reverse("evt_r1")
-    assert error_code(lambda: clear("evt_c1", 12_000)) == (409, "authorization_not_pending")
+    assert error_code(lambda: clear("evt_c1", 12_000)) == (Conflict, "authorization_not_pending")
 
 
-def test_reversal_after_clearing_409(card: str) -> None:
+def test_reversal_after_clearing_conflict(card: str) -> None:
     approve()
     clear("evt_c1", 12_000)
-    assert error_code(lambda: reverse("evt_r1")) == (409, "authorization_not_pending")
+    assert error_code(lambda: reverse("evt_r1")) == (Conflict, "authorization_not_pending")
 
 
-def test_reversal_of_declined_409(card: str) -> None:
+def test_reversal_of_declined_conflict(card: str) -> None:
     service.authorize(auth_request(mcc="7995"))
-    assert error_code(lambda: reverse("evt_r1")) == (409, "authorization_not_pending")
+    assert error_code(lambda: reverse("evt_r1")) == (Conflict, "authorization_not_pending")
 
 
-def test_unknown_ntid_404(card: str) -> None:
+def test_unknown_ntid_not_found(card: str) -> None:
     assert error_code(lambda: reverse("evt_r1", ntid="ntx_nope")) == (
-        404,
+        NotFound,
         "authorization_not_found",
     )
     assert error_code(lambda: clear("evt_c1", 1, ntid="ntx_nope")) == (
-        404,
+        NotFound,
         "authorization_not_found",
     )
 
@@ -127,10 +127,10 @@ def test_event_replay_is_idempotent(card: str) -> None:
     assert sql("SELECT count(*) FROM authorization_events") == [(1,)]
 
 
-def test_event_id_mismatch_409(card: str) -> None:
+def test_event_id_mismatch_conflict(card: str) -> None:
     approve(amount=12_000)
     reverse("evt_r1", amount=2_000)
-    assert error_code(lambda: reverse("evt_r1", amount=3_000)) == (409, "idempotency_mismatch")
+    assert error_code(lambda: reverse("evt_r1", amount=3_000)) == (Conflict, "idempotency_mismatch")
 
 
 def test_every_change_has_an_event_row(card: str) -> None:
@@ -159,12 +159,12 @@ def test_explicit_full_reversal_retry_without_amount_is_a_replay(card: str) -> N
     assert reverse("evt_r1") == first
 
 
-def test_partial_reversal_retry_without_amount_409(card: str) -> None:
+def test_partial_reversal_retry_without_amount_conflict(card: str) -> None:
     approve(amount=12_000)
     reverse("evt_r1", amount=2_000)
 
     # Omitted amount means "release everything"; the original event released 2,000 only.
-    assert error_code(lambda: reverse("evt_r1")) == (409, "idempotency_mismatch")
+    assert error_code(lambda: reverse("evt_r1")) == (Conflict, "idempotency_mismatch")
 
 
 def test_clearing_adds_to_company_posted_counter_once(card: str) -> None:

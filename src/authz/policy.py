@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from authz.domain import CardStatus, DeclineCode
+
 
 @dataclass(frozen=True)
 class CompanyState:
@@ -13,7 +15,7 @@ class CompanyState:
 
 @dataclass(frozen=True)
 class CardState:
-    status: str
+    status: CardStatus
     per_txn_limit: int
     monthly_limit: int
     blocked_mccs: frozenset[str]
@@ -23,8 +25,8 @@ class CardState:
 @dataclass(frozen=True)
 class Decision:
     approved: bool
-    decline_code: str | None
-    reasons: tuple[str, ...]
+    decline_code: DeclineCode | None
+    reasons: tuple[DeclineCode, ...]
     available_after: int
 
 
@@ -38,15 +40,18 @@ def evaluate(
 ) -> Decision:
     """Run every rule; all failures go in `reasons`, the first one is the network code.
 
-    Order below IS the precedence (ADR 0005).
+    Order below IS the precedence (ADR 0005), and matches DeclineCode's declaration order.
     """
     checks = (
-        ("card_inactive", card.status != "active"),
-        ("currency_mismatch", currency != company.currency),
-        ("mcc_blocked", mcc in card.blocked_mccs),
-        ("exceeds_per_transaction_limit", amount > card.per_txn_limit),
-        ("exceeds_card_monthly_limit", card.monthly_spend + amount > card.monthly_limit),
-        ("insufficient_credit", amount > available(company)),
+        (DeclineCode.CARD_INACTIVE, card.status != CardStatus.ACTIVE),
+        (DeclineCode.CURRENCY_MISMATCH, currency != company.currency),
+        (DeclineCode.MCC_BLOCKED, mcc in card.blocked_mccs),
+        (DeclineCode.EXCEEDS_PER_TRANSACTION_LIMIT, amount > card.per_txn_limit),
+        (
+            DeclineCode.EXCEEDS_CARD_MONTHLY_LIMIT,
+            card.monthly_spend + amount > card.monthly_limit,
+        ),
+        (DeclineCode.INSUFFICIENT_CREDIT, amount > available(company)),
     )
     reasons = tuple(code for code, failed in checks if failed)
     approved = not reasons

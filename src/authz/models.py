@@ -1,9 +1,11 @@
 """Request models: the trust boundary. Everything past here is validated."""
 
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
+
+from authz.domain import AuthStatus, CardStatus, DeclineCode, EventType, Outcome
 
 Amount = Annotated[StrictInt, Field(gt=0, le=10**12)]  # minor units; floats/strings rejected
 Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
@@ -48,7 +50,7 @@ class CardPatch(BaseModel):
     # Ops input: unknown fields are a client bug, not an evolving processor contract.
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    status: Literal["active", "frozen"] | None = None
+    status: CardStatus | None = None
     per_txn_limit: Amount | None = None
     monthly_limit: Amount | None = None
     blocked_mccs: list[Mcc] | None = Field(default=None, max_length=100)
@@ -56,15 +58,13 @@ class CardPatch(BaseModel):
 
 # --- responses: the outbound contract (rendered in OpenAPI) --------------------------------
 
-AuthStatus = Literal["declined", "pending", "reversed", "cleared"]
-
 
 class AuthorizationResponse(BaseModel):
     authorization_id: str | None  # None when nothing was persisted (card_not_found, system_error)
     network_transaction_id: str
-    decision: Literal["approved", "declined"]
-    decline_code: str | None
-    reasons: list[str]
+    decision: Outcome
+    decline_code: DeclineCode | None
+    reasons: list[DeclineCode]
     available_credit_after: int | None
 
 
@@ -72,7 +72,7 @@ class EventResponse(BaseModel):
     authorization_id: str
     network_transaction_id: str
     event_id: str
-    type: Literal["reversal", "clearing"]
+    type: EventType
     amount: int
     status: AuthStatus
     held_amount: int
@@ -95,7 +95,7 @@ class CardView(BaseModel):
     company_id: str
     holder_name: str
     last4: str
-    status: Literal["active", "frozen"]
+    status: CardStatus
     per_txn_limit: int
     monthly_limit: int
     blocked_mccs: list[str]
@@ -113,8 +113,8 @@ class AuthorizationView(BaseModel):
     merchant_name: str
     merchant_country: str
     status: AuthStatus
-    decline_code: str | None
-    reasons: list[str]
+    decline_code: DeclineCode | None
+    reasons: list[DeclineCode]
     held_amount: int
     cleared_amount: int
     created_at: datetime

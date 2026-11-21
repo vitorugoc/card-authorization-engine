@@ -14,8 +14,8 @@ import psycopg
 from conftest import COMPANY, auth_request, insert_card, insert_company, sql
 
 from authz import service
+from authz.domain import DomainError
 from authz.models import ClearingRequest, ReversalRequest
-from authz.service import DomainError
 
 
 def burst(n: int, call: Callable[[int], dict[str, Any]]) -> list[dict[str, Any]]:

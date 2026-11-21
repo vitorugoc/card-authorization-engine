@@ -13,6 +13,7 @@ from psycopg import OperationalError
 
 from authz import logging as authz_logging
 from authz import service, signature
+from authz.domain import Conflict, DomainError, NotFound
 from authz.models import (
     AuthorizationRequest,
     AuthorizationResponse,
@@ -25,7 +26,6 @@ from authz.models import (
     EventResponse,
     ReversalRequest,
 )
-from authz.service import DomainError
 
 
 def _required(name: str) -> str:
@@ -54,9 +54,26 @@ async def process_time(
     return response
 
 
+class Unauthorized(Exception):
+    """Transport-level: the caller could not prove who it is. Not a business rule."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+# The only place that knows how business errors map to HTTP.
+_STATUS: dict[type[DomainError], int] = {NotFound: 404, Conflict: 409}
+
+
 @app.exception_handler(DomainError)
 def domain_error(_: Request, exc: DomainError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status, content={"error": exc.code})
+    return JSONResponse(status_code=_STATUS[type(exc)], content={"error": exc.code})
+
+
+@app.exception_handler(Unauthorized)
+def unauthorized(_: Request, exc: Unauthorized) -> JSONResponse:
+    return JSONResponse(status_code=401, content={"error": exc.code})
 
 
 @app.exception_handler(OperationalError)
@@ -86,7 +103,7 @@ async def verified_webhook(request: Request, x_signature: Annotated[str, Header(
         logging.getLogger("authz").warning(
             "webhook.invalid_signature", extra={"fields": {"path": request.url.path}}
         )
-        raise DomainError(401, "invalid_signature")
+        raise Unauthorized("invalid_signature")
 
 
 processor = APIRouter(dependencies=[Depends(verified_webhook)], responses=errors(401))
@@ -122,7 +139,7 @@ def ops_token(authorization: Annotated[str, Header()] = "") -> None:
     # ponytail: one shared bearer token; per-user identity + audit trail (SSO) in production.
     expected = f"Bearer {OPS_TOKEN}".encode()
     if not hmac.compare_digest(authorization.encode(), expected):  # constant time
-        raise DomainError(401, "unauthorized")
+        raise Unauthorized("unauthorized")
 
 
 ops = APIRouter(dependencies=[Depends(ops_token)], responses=errors(401))

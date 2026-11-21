@@ -68,7 +68,9 @@ def test_openapi_documents_typed_response_contracts() -> None:
     schemas = spec["components"]["schemas"]
 
     decision = schemas["AuthorizationResponse"]["properties"]["decision"]
-    assert decision["enum"] == ["approved", "declined"]
+    assert decision["$ref"].endswith("/Outcome")
+    assert schemas["Outcome"]["enum"] == ["approved", "declined"]
+    assert schemas["DeclineCode"]["enum"][0] == "card_not_found"  # codes are documented
     for name in ("EventResponse", "CompanyView", "CardView", "AuthorizationView", "ErrorResponse"):
         assert name in schemas, name
 

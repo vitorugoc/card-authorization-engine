@@ -10,7 +10,7 @@ from conftest import auth_request, insert_card, insert_company, sql
 from psycopg.types.json import Jsonb
 
 from authz import service
-from authz.service import DomainError
+from authz.domain import Conflict, DomainError
 
 
 def test_replay_returns_identical_response_no_new_hold(card: str) -> None:
@@ -34,7 +34,7 @@ def test_same_ntid_different_amount_409_and_no_state_change(card: str) -> None:
     with pytest.raises(DomainError) as exc:
         service.authorize(auth_request(amount=99_000))
 
-    assert (exc.value.status, exc.value.code) == (409, "idempotency_mismatch")
+    assert (type(exc.value), exc.value.code) == (Conflict, "idempotency_mismatch")
     assert sql("SELECT amount FROM authorizations") == [(12_000,)]
 
 

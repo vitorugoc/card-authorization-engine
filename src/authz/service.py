@@ -13,21 +13,22 @@ from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
 from authz.db import pool
+from authz.domain import (
+    AuthStatus,
+    CardStatus,
+    Conflict,
+    DeclineCode,
+    ErrorCode,
+    EventType,
+    NotFound,
+    Outcome,
+)
 from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, ReversalRequest
 from authz.policy import CardState, CompanyState, available, evaluate
 
 log = logging.getLogger("authz")
 
 Conn = Connection[DictRow]
-
-
-class DomainError(Exception):
-    """Business error mapped to an HTTP status by the API layer."""
-
-    def __init__(self, status: int, code: str) -> None:
-        super().__init__(code)
-        self.status = status
-        self.code = code
 
 
 def _new_id(prefix: str) -> str:
@@ -86,7 +87,7 @@ def _card_state(conn: Conn, card_id: str) -> CardState:
     ).fetchone()
     row = _one(row, "card row")
     return CardState(
-        status=row["status"],
+        status=CardStatus(row["status"]),
         per_txn_limit=row["per_txn_limit"],
         monthly_limit=row["monthly_limit"],
         blocked_mccs=frozenset(row["blocked_mccs"]),
@@ -116,7 +117,7 @@ def _same_hash(req_hash: str) -> Matcher:
     return lambda row: bool(row["request_hash"] == req_hash)
 
 
-def _same_event(ntid: str, type_: str, amount: int | None) -> Matcher:
+def _same_event(ntid: str, type_: EventType, amount: int | None) -> Matcher:
     """Compare the RESOLVED request: an omitted reversal amount means "the whole remaining
     hold", so it matches an explicit amount that released everything, and vice versa."""
 
@@ -125,7 +126,9 @@ def _same_event(ntid: str, type_: str, amount: int | None) -> Matcher:
         if (stored["network_transaction_id"], stored["type"]) != (ntid, type_):
             return False
         if amount is None:
-            return bool(stored["type"] == "reversal" and stored["status"] == "reversed")
+            return bool(
+                stored["type"] == EventType.REVERSAL and stored["status"] == AuthStatus.REVERSED
+            )
         return bool(amount == stored["amount"])
 
     return matches
@@ -138,7 +141,7 @@ def _stored_response(conn: Conn, kind: str, key: str, matches: Matcher) -> dict[
         return None
     if not matches(row):
         log.warning("idempotency.mismatch", extra={"fields": {"kind": kind, "key": key}})
-        raise DomainError(409, "idempotency_mismatch")
+        raise Conflict(ErrorCode.IDEMPOTENCY_MISMATCH)
     response: dict[str, Any] = row["response"]
     return response
 
@@ -182,7 +185,8 @@ def authorize(req: AuthorizationRequest) -> dict[str, Any]:
             "authorization.system_error",
             extra={"fields": {"network_transaction_id": req.network_transaction_id}},
         )
-        return _response(None, req, "declined", "system_error", ["system_error"], None)
+        code = DeclineCode.SYSTEM_ERROR
+        return _response(None, req, Outcome.DECLINED, code, [code], None)
     # Never log holder_name: the only PII we hold.
     fields = {
         **response,
@@ -200,7 +204,8 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
         _begin(conn)
         card = conn.execute("SELECT company_id FROM cards WHERE id = %s", (req.card_id,)).fetchone()
         if card is None:
-            response = _response(None, req, "declined", "card_not_found", ["card_not_found"], None)
+            code = DeclineCode.CARD_NOT_FOUND
+            response = _response(None, req, Outcome.DECLINED, code, [code], None)
             return response, False
 
         _lock_company(conn, card["company_id"])
@@ -224,11 +229,11 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
         }
 
         auth_id = _new_id("auth")
-        status = "pending" if decision.approved else "declined"
+        status = AuthStatus.PENDING if decision.approved else AuthStatus.DECLINED
         response = _response(
             auth_id,
             req,
-            "approved" if decision.approved else "declined",
+            Outcome.APPROVED if decision.approved else Outcome.DECLINED,
             decision.decline_code,
             list(decision.reasons),
             decision.available_after,
@@ -255,9 +260,9 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
 def _response(
     auth_id: str | None,
     req: AuthorizationRequest,
-    decision: str,
-    decline_code: str | None,
-    reasons: list[str],
+    decision: Outcome,
+    decline_code: DeclineCode | None,
+    reasons: list[DeclineCode],
     available_after: int | None,
 ) -> dict[str, Any]:
     return {
@@ -275,15 +280,15 @@ def _response(
 
 def reverse(ntid: str, req: ReversalRequest) -> dict[str, Any]:
     """Release all (amount=None) or part of the remaining hold."""
-    return _apply_event(ntid, "reversal", req.event_id, req.amount)
+    return _apply_event(ntid, EventType.REVERSAL, req.event_id, req.amount)
 
 
 def clear(ntid: str, req: ClearingRequest) -> dict[str, Any]:
     """Final settlement: post the amount, release the whole hold. Over-clear is posted."""
-    return _apply_event(ntid, "clearing", req.event_id, req.amount)
+    return _apply_event(ntid, EventType.CLEARING, req.event_id, req.amount)
 
 
-def _apply_event(ntid: str, type_: str, event_id: str, amount: int | None) -> dict[str, Any]:
+def _apply_event(ntid: str, type_: EventType, event_id: str, amount: int | None) -> dict[str, Any]:
     try:
         response = _apply_event_tx(ntid, type_, event_id, amount)
     except errors.UniqueViolation as exc:
@@ -292,14 +297,16 @@ def _apply_event(ntid: str, type_: str, event_id: str, amount: int | None) -> di
     return response
 
 
-def _apply_event_tx(ntid: str, type_: str, event_id: str, amount: int | None) -> dict[str, Any]:
+def _apply_event_tx(
+    ntid: str, type_: EventType, event_id: str, amount: int | None
+) -> dict[str, Any]:
     with pool().connection() as conn:
         _begin(conn)
         found = conn.execute(
             "SELECT company_id FROM authorizations WHERE network_transaction_id = %s", (ntid,)
         ).fetchone()
         if found is None:
-            raise DomainError(404, "authorization_not_found")
+            raise NotFound(ErrorCode.AUTHORIZATION_NOT_FOUND)
         company_id = found["company_id"]
         _lock_company(conn, company_id)
         stored = _stored_response(conn, "event", event_id, _same_event(ntid, type_, amount))
@@ -312,20 +319,20 @@ def _apply_event_tx(ntid: str, type_: str, event_id: str, amount: int | None) ->
             (ntid,),
         ).fetchone()
         auth = _one(auth, "authorization row")
-        if auth["status"] != "pending":
-            raise DomainError(409, "authorization_not_pending")
+        if auth["status"] != AuthStatus.PENDING:
+            raise Conflict(ErrorCode.AUTHORIZATION_NOT_PENDING)
 
         held: int = auth["held_amount"]
-        if type_ == "reversal":
+        if type_ == EventType.REVERSAL:
             applied = held if amount is None else amount
             if applied > held:
-                raise DomainError(409, "amount_exceeds_hold")
+                raise Conflict(ErrorCode.AMOUNT_EXCEEDS_HOLD)
             new_held, cleared = held - applied, 0
-            status = "pending" if new_held else "reversed"
+            status = AuthStatus.PENDING if new_held else AuthStatus.REVERSED
         else:
             if amount is None:
                 raise ValueError("a clearing always carries an amount")
-            applied, new_held, cleared, status = amount, 0, amount, "cleared"
+            applied, new_held, cleared, status = amount, 0, amount, AuthStatus.CLEARED
             if amount > held:
                 over = {"network_transaction_id": ntid, "over_clear_delta": amount - held}
                 log.info("clearing.over_clear", extra={"fields": over})
@@ -378,7 +385,7 @@ def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
         _begin(conn)
         found = conn.execute("SELECT company_id FROM cards WHERE id = %s", (card_id,)).fetchone()
         if found is None:
-            raise DomainError(404, "card_not_found")
+            raise NotFound(ErrorCode.CARD_NOT_FOUND)
         _lock_company(conn, found["company_id"])
         if changes:
             assignments = sql.SQL(", ").join(
@@ -404,7 +411,7 @@ def get_company(company_id: str) -> dict[str, Any]:
     with pool().connection() as conn:
         row = conn.execute("SELECT id, name FROM companies WHERE id = %s", (company_id,)).fetchone()
         if row is None:
-            raise DomainError(404, "company_not_found")
+            raise NotFound(ErrorCode.COMPANY_NOT_FOUND)
         state = _company_state(conn, company_id)
     return {
         **row,
@@ -425,7 +432,7 @@ def get_card(card_id: str) -> dict[str, Any]:
             (card_id,),
         ).fetchone()
         if row is None:
-            raise DomainError(404, "card_not_found")
+            raise NotFound(ErrorCode.CARD_NOT_FOUND)
         spend = _card_state(conn, card_id).monthly_spend
     return {**row, "monthly_spend": spend}
 
