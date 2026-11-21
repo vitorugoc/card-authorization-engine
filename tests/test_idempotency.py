@@ -9,7 +9,7 @@ import pytest
 from conftest import auth_request, insert_card, insert_company, sql
 from psycopg.types.json import Jsonb
 
-from authz import service
+from authz import idempotency, service
 from authz.domain import Conflict, DomainError
 
 
@@ -75,7 +75,7 @@ def test_cross_company_ntid_race_resolved_by_unique_constraint(
     insert_card("card_other", company_id="co_other")
     req = auth_request()
     racer_response = {"authorization_id": "auth_racer", "decision": "approved"}
-    racer_hash = service.request_hash(req.decision_fields()) if same_payload else "different"
+    racer_hash = idempotency.request_hash(req.decision_fields()) if same_payload else "different"
 
     racer = threading.Thread(target=_insert_in_open_transaction, args=(racer_hash, racer_response))
     racer.start()

@@ -1,18 +1,16 @@
 """Transaction scripts. Every money write locks the company row first (ADR 0002)."""
 
-import hashlib
-import json
 import logging
 import time
 import uuid
-from collections.abc import Callable
 from typing import Any
 
-from psycopg import Connection, OperationalError, errors, sql
+from psycopg import OperationalError, errors, sql
 from psycopg.rows import DictRow
 from psycopg.types.json import Jsonb
 
-from authz.db import pool
+from authz import idempotency
+from authz.db import Conn, pool
 from authz.domain import (
     AuthStatus,
     CardStatus,
@@ -27,8 +25,6 @@ from authz.models import AuthorizationRequest, CardPatch, ClearingRequest, Rever
 from authz.policy import CardState, CompanyState, available, evaluate
 
 log = logging.getLogger("authz")
-
-Conn = Connection[DictRow]
 
 
 def _new_id(prefix: str) -> str:
@@ -95,87 +91,17 @@ def _card_state(conn: Conn, card_id: str) -> CardState:
     )
 
 
-# --- idempotency (ADR 0003) ----------------------------------------------------------------
-
-_STORED = {
-    "authorization": (
-        "SELECT request_hash, response FROM authorizations WHERE network_transaction_id = %s"
-    ),
-    "event": "SELECT request_hash, response FROM authorization_events WHERE event_id = %s",
-}
-
-
-def request_hash(fields: dict[str, Any]) -> str:
-    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-Matcher = Callable[[DictRow], bool]
-
-
-def _same_hash(req_hash: str) -> Matcher:
-    return lambda row: bool(row["request_hash"] == req_hash)
-
-
-def _same_event(ntid: str, type_: EventType, amount: int | None) -> Matcher:
-    """Compare the RESOLVED request: an omitted reversal amount means "the whole remaining
-    hold", so it matches an explicit amount that released everything, and vice versa."""
-
-    def matches(row: DictRow) -> bool:
-        stored = row["response"]
-        if (stored["network_transaction_id"], stored["type"]) != (ntid, type_):
-            return False
-        if amount is None:
-            return bool(
-                stored["type"] == EventType.REVERSAL and stored["status"] == AuthStatus.REVERSED
-            )
-        return bool(amount == stored["amount"])
-
-    return matches
-
-
-def _stored_response(conn: Conn, kind: str, key: str, matches: Matcher) -> dict[str, Any] | None:
-    """Stored response for a replay; 409 if the same id arrives with a different payload."""
-    row = conn.execute(_STORED[kind], (key,)).fetchone()
-    if row is None:
-        return None
-    if not matches(row):
-        log.warning("idempotency.mismatch", extra={"fields": {"kind": kind, "key": key}})
-        raise Conflict(ErrorCode.IDEMPOTENCY_MISMATCH)
-    response: dict[str, Any] = row["response"]
-    return response
-
-
-_UNIQUE_KEYS = {
-    "authorization": "authorizations_network_transaction_id_key",
-    "event": "authorization_events_event_id_key",
-}
-
-
-def _replay_after_race(
-    exc: errors.UniqueViolation, kind: str, key: str, matches: Matcher
-) -> dict[str, Any]:
-    """The same id was committed meanwhile under ANOTHER company's lock; UNIQUE caught it."""
-    if exc.diag.constraint_name != _UNIQUE_KEYS[kind]:
-        raise exc
-    with pool().connection() as conn:
-        stored = _stored_response(conn, kind, key, matches)
-    if stored is None:
-        raise RuntimeError(f"UNIQUE violation on {kind} {key} but no committed row")
-    return stored
-
-
 # --- authorization -------------------------------------------------------------------------
 
 
 def authorize(req: AuthorizationRequest) -> dict[str, Any]:
     started = time.perf_counter()
-    req_hash = request_hash(req.decision_fields())
+    req_hash = idempotency.request_hash(req.decision_fields())
     try:
         response, replay = _authorize(req, req_hash)
     except errors.UniqueViolation as exc:
-        response = _replay_after_race(
-            exc, "authorization", req.network_transaction_id, _same_hash(req_hash)
+        response = idempotency.replay_after_race(
+            exc, "authorization", req.network_transaction_id, idempotency.same_hash(req_hash)
         )
         replay = True
     except OperationalError:
@@ -210,8 +136,8 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
 
         _lock_company(conn, card["company_id"])
         # Lookup AFTER the lock: concurrent duplicates serialize and the second sees the first.
-        stored = _stored_response(
-            conn, "authorization", req.network_transaction_id, _same_hash(req_hash)
+        stored = idempotency.stored_response(
+            conn, "authorization", req.network_transaction_id, idempotency.same_hash(req_hash)
         )
         if stored is not None:
             return stored, True
@@ -292,7 +218,9 @@ def _apply_event(ntid: str, type_: EventType, event_id: str, amount: int | None)
     try:
         response = _apply_event_tx(ntid, type_, event_id, amount)
     except errors.UniqueViolation as exc:
-        return _replay_after_race(exc, "event", event_id, _same_event(ntid, type_, amount))
+        return idempotency.replay_after_race(
+            exc, "event", event_id, idempotency.same_event(ntid, type_, amount)
+        )
     log.info(f"{type_}.applied", extra={"fields": response})
     return response
 
@@ -309,7 +237,9 @@ def _apply_event_tx(
             raise NotFound(ErrorCode.AUTHORIZATION_NOT_FOUND)
         company_id = found["company_id"]
         _lock_company(conn, company_id)
-        stored = _stored_response(conn, "event", event_id, _same_event(ntid, type_, amount))
+        stored = idempotency.stored_response(
+            conn, "event", event_id, idempotency.same_event(ntid, type_, amount)
+        )
         if stored is not None:
             return stored
 
@@ -368,7 +298,9 @@ def _apply_event_tx(
                 auth["id"],
                 type_,
                 applied,
-                request_hash({"ntid": ntid, "type": type_, "amount": applied}),  # resolved
+                idempotency.request_hash(
+                    {"ntid": ntid, "type": type_, "amount": applied}
+                ),  # resolved
                 Jsonb(response),
             ),
         )

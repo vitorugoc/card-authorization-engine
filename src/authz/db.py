@@ -6,10 +6,12 @@ from psycopg import Connection
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import ConnectionPool
 
-_pool: ConnectionPool[Connection[DictRow]] | None = None
+Conn = Connection[DictRow]
+
+_pool: ConnectionPool[Conn] | None = None
 
 
-def pool() -> ConnectionPool[Connection[DictRow]]:
+def pool() -> ConnectionPool[Conn]:
     global _pool
     if _pool is None:
         # ponytail: fixed size; past 25 in-flight requests callers queue here for at most
@@ -20,7 +22,7 @@ def pool() -> ConnectionPool[Connection[DictRow]]:
             max_size=25,
             timeout=1.0,  # default is 30s: far past any card network's response window
             kwargs={"row_factory": dict_row},
-            connection_class=Connection[DictRow],
+            connection_class=Conn,
             open=True,
         )
     return _pool
