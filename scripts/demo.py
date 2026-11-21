@@ -15,7 +15,12 @@ API = os.environ.get("API_URL", "http://localhost:8000")
 PAUSE = "--pause" in sys.argv
 GREEN, RED, YELLOW, BOLD, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[0m"
 
-client = httpx.Client(base_url=API, timeout=5, limits=httpx.Limits(max_connections=20))
+client = httpx.Client(
+    base_url=API,
+    timeout=5,
+    limits=httpx.Limits(max_connections=20),
+    headers={"Authorization": f"Bearer {os.environ['OPS_TOKEN']}"},  # ops routes
+)
 
 
 def signed_post(path: str, payload: dict[str, Any]) -> httpx.Response:

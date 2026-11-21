@@ -395,6 +395,11 @@ def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
 # --- reads ---------------------------------------------------------------------------------
 
 
+def ping() -> None:
+    with pool().connection() as conn:
+        conn.execute("SELECT 1")
+
+
 def get_company(company_id: str) -> dict[str, Any]:
     with pool().connection() as conn:
         row = conn.execute("SELECT id, name FROM companies WHERE id = %s", (company_id,)).fetchone()

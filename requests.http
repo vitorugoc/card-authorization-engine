@@ -1,7 +1,9 @@
 ### Requests for the REST Client (VS Code) / JetBrains HTTP client. Run `make seed` first.
 ### Processor routes (authorize / reversal / clearing) need an HMAC `X-Signature` header and
-### return 401 from here as-is; see scripts/demo.py `signed_post`. Ops routes work unsigned.
+### return 401 from here as-is; see scripts/demo.py `signed_post`. Ops routes (GET/PATCH below)
+### need the bearer token from docker-compose.yml (OPS_TOKEN).
 @api = http://localhost:8000
+@ops = Bearer ops_local_demo_only
 
 ### Authorize (cross-border: merchant charged USD, network bills MXN)
 POST {{api}}/v1/authorizations
@@ -29,15 +31,19 @@ Content-Type: application/json
 
 ### Company balances
 GET {{api}}/v1/companies/co_demo
+Authorization: {{ops}}
 
 ### Card + monthly spend
 GET {{api}}/v1/cards/card_demo
+Authorization: {{ops}}
 
 ### Card authorizations
 GET {{api}}/v1/cards/card_demo/authorizations
+Authorization: {{ops}}
 
 ### Freeze / unfreeze / change limits
 PATCH {{api}}/v1/cards/card_demo
+Authorization: {{ops}}
 Content-Type: application/json
 
 {"status": "frozen"}
