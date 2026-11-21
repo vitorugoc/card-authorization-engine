@@ -14,6 +14,8 @@ import psycopg
 from conftest import COMPANY, auth_request, insert_card, insert_company, sql
 
 from authz import service
+from authz.models import ClearingRequest, ReversalRequest
+from authz.service import DomainError
 
 
 def burst(n: int, call: Callable[[int], dict[str, Any]]) -> list[dict[str, Any]]:
@@ -84,3 +86,63 @@ def test_lock_timeout_fails_closed_with_system_error(card: str) -> None:
     assert res["authorization_id"] is None
     assert elapsed < 1.0
     assert sql("SELECT count(*) FROM authorizations") == [(0,)]
+
+
+def outcome(call: Callable[[], object]) -> str:
+    try:
+        call()
+    except DomainError as exc:
+        return exc.code
+    return "ok"
+
+
+def test_concurrent_clearings_with_distinct_event_ids_settle_once(card: str) -> None:
+    service.authorize(auth_request("ntx_1", amount=12_000))
+
+    results = burst(
+        10,
+        lambda i: {
+            "r": outcome(
+                lambda: service.clear("ntx_1", ClearingRequest(event_id=f"evt_{i}", amount=12_000))
+            )
+        },
+    )
+
+    assert sorted(r["r"] for r in results) == ["authorization_not_pending"] * 9 + ["ok"]
+    assert sql("SELECT posted FROM companies") == [(12_000,)]
+    assert sql("SELECT count(*) FROM authorization_events") == [(1,)]
+
+
+def test_concurrent_reversal_and_clearing_exactly_one_wins(card: str) -> None:
+    service.authorize(auth_request("ntx_1", amount=12_000))
+    calls: list[Callable[[], object]] = [
+        lambda: service.reverse("ntx_1", ReversalRequest(event_id="evt_r")),
+        lambda: service.clear("ntx_1", ClearingRequest(event_id="evt_c", amount=11_000)),
+    ]
+
+    results = burst(2, lambda i: {"r": outcome(calls[i])})
+
+    assert sorted(r["r"] for r in results) == ["authorization_not_pending", "ok"]
+    [(status, held, cleared)] = sql(
+        "SELECT status, held_amount, cleared_amount FROM authorizations"
+    )
+    [(posted,)] = sql("SELECT posted FROM companies")
+    assert (status, held, cleared, posted) in {
+        ("reversed", 0, 0, 0),
+        ("cleared", 0, 11_000, 11_000),
+    }
+
+
+def test_freeze_committed_while_auth_waits_for_the_lock_is_honoured(card: str) -> None:
+    """TOCTOU: the auth reads the card before the freeze commits, then waits on the lock.
+    It must re-read the card under the lock and decline, never approve on a stale read."""
+    with psycopg.connect(os.environ["DATABASE_URL"]) as ops:
+        ops.execute("SELECT 1 FROM companies WHERE id = %s FOR UPDATE", (COMPANY,))
+        ops.execute("UPDATE cards SET status = 'frozen' WHERE id = %s", (card,))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(service.authorize, auth_request())
+            time.sleep(0.05)  # the auth is now queued on the company lock (timeout 200ms)
+            ops.commit()
+            res = pending.result()
+
+    assert res["decline_code"] == "card_inactive"
