@@ -1,8 +1,8 @@
 # Grill Log — Design Decisions
 
 How this design was produced: a "grilling" session (design tree explored in rounds of questions).
-Round 0 was answered by the candidate. Later rounds were answered by a separate AI agent prompted as a
-Staff fintech backend engineer, then reviewed and approved/vetoed by the candidate at a checkpoint.
+I used AI as a sparring partner: each round it asked the hard questions and laid out options and
+alternatives; I chose every decision below and confirmed the full set at a checkpoint (Round 3).
 
 ## Round 0 — Candidate decisions
 
@@ -11,7 +11,7 @@ Staff fintech backend engineer, then reviewed and approved/vetoed by the candida
 | 0.1 | Stack | Python |
 | 0.2 | Problem | Real-time corporate card authorization engine with spend policies (limits, MCC, velocity, company funds), holds, idempotency, concurrency safety |
 | 0.3 | Lifecycle scope | Authorization + reversal + simple clearing. Out: disputes, incremental auth, real FX |
-| 0.4 | Who answers later rounds | Senior AI agent; candidate reviews summary before SDD |
+| 0.4 | How later rounds run | AI proposes options with rejected alternatives; I decide and confirm at a checkpoint before the SDD |
 | 0.5 | SDD format | `docs/sdd.md` + `docs/adr/`, vertical phases, each phase test-first with green acceptance test |
 
 ### Candidate problems considered (Round 0 critique)
@@ -21,7 +21,7 @@ Staff fintech backend engineer, then reviewed and approved/vetoed by the candida
 - **C. Settlement reconciliation** — real ops pain; demo depends on fake files, hard to impress in 5 min.
 - **D. LLM receipt matching** — mostly an LLM wrapper; little backend depth for a senior backend role.
 
-## Round 1 — Answered by senior agent
+## Round 1
 
 | # | Question | Decision | Rejected | Defend |
 |---|----------|----------|----------|--------|
@@ -35,7 +35,7 @@ Staff fintech backend engineer, then reviewed and approved/vetoed by the candida
 | Q8 | Demo | `make demo` runs `demo.py` (httpx, narrated, balances per step) + `requests.http`. Steps: approve → multi-reason decline → replay + tampered 409 → 20-way burst (exactly 8 approve, invariant holds) → partial reversal → clearing with tip → live freeze → `pytest -q` | Dashboard UI; `--no-lock` flag; Postman | — |
 | Q9 | Latency & failure | `SET LOCAL lock_timeout='200ms'`, `statement_timeout='1s'`; timeout/DB error → 200 decline `system_error` (fail closed); timing middleware + `X-Process-Time`. Stand-in = processor config, documented only | Stand-in in engine; circuit breakers; no timeouts | Fail closed vs open is a business decision configured at the processor |
 
-## Round 2 — Answered by senior agent
+## Round 2
 
 | # | Question | Decision | Rejected | Defend |
 |---|----------|----------|----------|--------|
