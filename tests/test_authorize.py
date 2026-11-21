@@ -1,6 +1,7 @@
 from conftest import COMPANY, auth_request, insert_card, insert_company, sql
 
 from authz import service
+from authz.models import ClearingRequest
 
 
 def test_approve_creates_hold_and_reduces_available(card: str) -> None:
@@ -70,10 +71,7 @@ def test_monthly_limit_counts_holds_and_cleared_current_month_only(card: str) ->
     )
     service.authorize(auth_request("ntx_a", amount=40_000))
     service.authorize(auth_request("ntx_b", amount=30_000))
-    sql(
-        "UPDATE authorizations SET status = 'cleared', held_amount = 0, cleared_amount = 30000"
-        " WHERE network_transaction_id = 'ntx_b'"
-    )
+    service.clear("ntx_b", ClearingRequest(event_id="evt_b", amount=30_000))
 
     # 40,000 held + 30,000 cleared this month: 30,000 left of 100,000.
     assert service.authorize(auth_request("ntx_ok", amount=30_000))["decision"] == "approved"

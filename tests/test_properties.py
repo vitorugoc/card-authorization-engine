@@ -7,7 +7,7 @@ credit invariant must always hold (over-clear is covered by its own example test
 
 from dataclasses import dataclass
 
-from conftest import COMPANY, auth_request, insert_card, insert_company, truncate
+from conftest import COMPANY, auth_request, insert_card, insert_company, sql, truncate
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -74,3 +74,7 @@ def test_random_lifecycle_matches_reference_model(data: st.DataObject) -> None:
         assert company["held"] == sum(a.held for a in model)
         assert company["posted"] == sum(a.cleared for a in model)
         assert 0 <= company["held"] + company["posted"] <= LIMIT
+        # Reconciliation: the running counter always equals the history it summarizes.
+        assert sql("SELECT posted FROM companies") == sql(
+            "SELECT COALESCE(SUM(cleared_amount), 0) FROM authorizations"
+        )

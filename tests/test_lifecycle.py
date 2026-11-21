@@ -165,3 +165,16 @@ def test_partial_reversal_retry_without_amount_409(card: str) -> None:
 
     # Omitted amount means "release everything"; the original event released 2,000 only.
     assert error_code(lambda: reverse("evt_r1")) == (409, "idempotency_mismatch")
+
+
+def test_clearing_adds_to_company_posted_counter_once(card: str) -> None:
+    """Posted spend is a running total on the company row (ADR 0004), not a SUM over history."""
+    approve("ntx_1", amount=12_000)
+    approve("ntx_2", amount=5_000)
+
+    clear("evt_c1", amount=13_800, ntid="ntx_1")
+    clear("evt_c1", amount=13_800, ntid="ntx_1")  # replay: must not count twice
+    reverse("evt_r2", ntid="ntx_2")  # reversals never touch posted
+
+    assert sql("SELECT posted FROM companies") == [(13_800,)]
+    assert service.get_company(COMPANY)["posted"] == 13_800
