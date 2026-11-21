@@ -5,12 +5,13 @@ import time
 # Tests never touch the demo database.
 os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import psycopg
 import pytest
 
+from authz import db
 from authz.models import AuthorizationRequest
 from authz.signature import sign
 
@@ -22,6 +23,14 @@ CARD = "card_test"
 def truncate() -> None:
     with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
         conn.execute(f"TRUNCATE {TABLES} CASCADE")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def connection_pool() -> Iterator[None]:
+    """Service tests call use cases directly, without the app lifespan that opens the pool."""
+    db.open_pool(os.environ["DATABASE_URL"])
+    yield
+    db.close_pool()
 
 
 @pytest.fixture(autouse=True)

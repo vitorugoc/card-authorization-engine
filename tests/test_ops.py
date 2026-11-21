@@ -37,11 +37,13 @@ def test_ops_routes_require_bearer_token(
 
 def test_app_refuses_to_start_without_required_config() -> None:
     env = {k: v for k, v in os.environ.items() if k != "OPS_TOKEN"}
-    res = subprocess.run(
-        [sys.executable, "-c", "import authz.api"], env=env, capture_output=True, text=True
+    boot = (
+        "from fastapi.testclient import TestClient; from authz.api import app\n"
+        "with TestClient(app): pass"  # runs the lifespan, like uvicorn startup
     )
+    res = subprocess.run([sys.executable, "-c", boot], env=env, capture_output=True, text=True)
     assert res.returncode != 0
-    assert "OPS_TOKEN must be set" in res.stderr
+    assert "missing required config: OPS_TOKEN" in res.stderr
 
 
 def test_health_checks_the_database(monkeypatch: pytest.MonkeyPatch) -> None:

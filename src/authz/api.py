@@ -2,17 +2,18 @@
 
 import hmac
 import logging
-import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 
+from authz import db, service, signature
 from authz import logging as authz_logging
-from authz import service, signature
+from authz.config import Settings, get_settings
 from authz.domain import Conflict, DomainError, NotFound
 from authz.models import (
     AuthorizationRequest,
@@ -28,20 +29,18 @@ from authz.models import (
 )
 
 
-def _required(name: str) -> str:
-    """Fail at boot, not on the first swipe: a missing secret must never reach a request."""
-    value = os.environ.get(name, "")
-    if not value:
-        raise RuntimeError(f"{name} must be set")
-    return value
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # Fail at boot, not on the first swipe: missing config must never reach a request.
+    settings = get_settings()
+    authz_logging.configure()
+    db.open_pool(settings.database_url)
+    yield
+    db.close_pool()
 
 
-WEBHOOK_SECRET = _required("WEBHOOK_SECRET")
-OPS_TOKEN = _required("OPS_TOKEN")
-_required("DATABASE_URL")
-
-authz_logging.configure()
-app = FastAPI(title="Card Authorization Engine")
+app = FastAPI(title="Card Authorization Engine", lifespan=lifespan)
+Config = Annotated[Settings, Depends(get_settings)]
 
 
 @app.middleware("http")
@@ -96,10 +95,12 @@ def errors(*statuses: int) -> dict[int | str, dict[str, Any]]:
 # --- processor-facing (signed webhooks) ----------------------------------------------------
 
 
-async def verified_webhook(request: Request, x_signature: Annotated[str, Header()] = "") -> None:
+async def verified_webhook(
+    request: Request, settings: Config, x_signature: Annotated[str, Header()] = ""
+) -> None:
     """Runs before body validation: an unsigned caller learns nothing about our schema."""
     body = await request.body()  # raw bytes: the MAC is over exactly what was sent
-    if not signature.verify(WEBHOOK_SECRET, x_signature, body, now=time.time()):
+    if not signature.verify(settings.webhook_secret, x_signature, body, now=time.time()):
         logging.getLogger("authz").warning(
             "webhook.invalid_signature", extra={"fields": {"path": request.url.path}}
         )
@@ -135,9 +136,9 @@ app.include_router(processor)
 # --- ops (card program admins) ------------------------------------------------------------
 
 
-def ops_token(authorization: Annotated[str, Header()] = "") -> None:
+def ops_token(settings: Config, authorization: Annotated[str, Header()] = "") -> None:
     # ponytail: one shared bearer token; per-user identity + audit trail (SSO) in production.
-    expected = f"Bearer {OPS_TOKEN}".encode()
+    expected = f"Bearer {settings.ops_token}".encode()
     if not hmac.compare_digest(authorization.encode(), expected):  # constant time
         raise Unauthorized("unauthorized")
 
