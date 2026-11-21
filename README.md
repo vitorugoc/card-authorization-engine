@@ -13,7 +13,7 @@ You only need Docker.
 make up      # build + start Postgres 16 and the API on :8000
 make demo    # reset demo data and run the narrated end-to-end demo
 make test    # 92 tests against a real Postgres (separate test database)
-make lint    # ruff + mypy --strict
+make lint    # ruff + mypy --strict (src, tests, scripts)
 make loadtest  # throughput: one hot company, 16 companies, hot + 500k history (wipes demo data)
 ```
 
@@ -75,13 +75,16 @@ Decline codes, in precedence order: `card_not_found`, `card_inactive`, `currency
 
 ```
 src/authz/
-  policy.py    pure spend rules: no IO, unit-tested at every boundary
-  service.py   transaction scripts: lock company → idempotency → evaluate → persist
-  models.py    pydantic request models (trust boundary)
-  api.py       FastAPI routes + status mapping
-  db.py        connection pool
-  signature.py HMAC webhook signing/verification
-  logging.py   JSON log formatter
+  domain.py      shared vocabulary: StrEnums (statuses, decline codes) + business errors. No IO, no HTTP
+  policy.py      pure spend rules: no IO, unit-tested at every boundary
+  service.py     use cases as transaction scripts: lock company → idempotency → evaluate → persist
+  idempotency.py exactly-once mechanism: request hash, replay matchers, UNIQUE-race resolution
+  models.py      pydantic request models (trust boundary) and typed response models (use-case output)
+  api.py         FastAPI: lifespan, routers + auth dependencies, the only DomainError → HTTP mapping
+  config.py      Settings, validated at boot and injected as a dependency
+  db.py          connection pool, opened/closed by the lifespan
+  signature.py   HMAC webhook signing/verification
+  logging.py     JSON log formatter
 db/schema.sql  tables + CHECK constraints for the hold invariants
 scripts/       seed.py, demo.py, loadtest.py
 tests/         policy + signature (unit), authorize, idempotency, concurrency, lifecycle, api, ops, properties
@@ -94,4 +97,6 @@ docs/          sdd.md (spec), adr/ (6 decisions), grill-log.md (how the design w
 - `test_idempotency.py` includes a real cross-company race on the same transaction id, which is resolved by the UNIQUE constraint.
 - `test_properties.py` runs Hypothesis model-based tests: random auth/reverse/clear sequences must match a reference model.
 
-Stack: Python 3.12, FastAPI (sync), psycopg 3 with raw SQL, Postgres 16, uv, pytest, Hypothesis, ruff, mypy.
+**Dependencies point inwards:** `api` → `service` → `idempotency`/`db` → `policy`/`domain`. The domain and policy layers import nothing from HTTP or the database. There are no repository or DI-container layers on purpose. The SQL sits next to the transaction it protects, so the `FOR UPDATE` that carries the correctness guarantee is visible in the code under review.
+
+Stack: Python 3.12, FastAPI (sync), psycopg 3 with raw SQL, Postgres 16, uv, pytest, Hypothesis, ruff, mypy --strict (src, tests and scripts).

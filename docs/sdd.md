@@ -405,3 +405,9 @@ Places where the implementation differs from the original plan:
   - **Bearer token on ops routes** (`OPS_TOKEN`, constant-time compare).
   - **Fail-fast config:** missing secrets stop the boot.
   - **`/health` checks the database** and returns 503 when it is unreachable.
+- **Clean-code pass (2026-11-20), no behaviour change:**
+  - **`domain.py`** holds the shared vocabulary: StrEnums for card status, authorization status, outcome, decline codes (declaration order = precedence), event type and error codes. Business errors are `NotFound` and `Conflict`, and they carry only a code. `api.py` is the only place that maps them to HTTP statuses.
+  - **`idempotency.py`** is extracted from `service.py`. It holds the request hash, the replay matchers, the stored-response lookup and the UNIQUE-race resolution.
+  - **Use cases return the typed response models** instead of `dict[str, Any]`. Replays are re-validated from the stored JSON, so fresh and replayed responses have the same type.
+  - **The FastAPI `lifespan`** validates `Settings` (`config.py`), configures logging, and opens and closes the pool. Nothing runs at import time. The settings are also injected as a dependency.
+  - **`py.typed`** is added, and mypy `--strict` also covers `tests/` and `scripts/`.
