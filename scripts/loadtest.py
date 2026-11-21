@@ -2,6 +2,8 @@
 
   hot     every request hits ONE company: worst case for the per-company row lock
   spread  requests spread over 16 companies: locks rarely collide
+  history hot again, after HISTORY settled clearings land on that company (about a year of
+          spend for a mid-size customer): shows whether the balance cost grows with history
 
 Wipes the demo database (run `make demo` afterwards to restore the demo data).
 Client and server share one laptop, so read the numbers as relative, not absolute.
@@ -24,6 +26,7 @@ SECRET = os.environ["WEBHOOK_SECRET"]
 WORKERS = int(os.environ.get("WORKERS", "16"))
 REQUESTS = int(os.environ.get("REQUESTS", "2000"))
 COMPANIES = 16
+HISTORY = int(os.environ.get("HISTORY", "500000"))
 
 
 def seed() -> None:
@@ -41,6 +44,24 @@ def seed() -> None:
                    VALUES (%s, %s, 'Load Test', '0000', 'active', 1000000, 100000000000)""",
                 (f"lt_card_{i}", f"lt_co_{i}"),
             )
+
+
+def add_history() -> None:
+    """Settled clearings from 40 days ago: they count for the credit line, not the month."""
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        conn.execute(
+            """INSERT INTO authorizations
+                 (id, network_transaction_id, card_id, company_id, amount, currency,
+                  merchant_amount, merchant_currency, mcc, merchant_name, merchant_country,
+                  status, held_amount, cleared_amount, policy_snapshot, request_hash, response,
+                  created_at)
+               SELECT 'lt_hist_' || g, 'lt_hist_' || g, 'lt_card_0', 'lt_co_0', 1000, 'MXN',
+                      1000, 'MXN', '5812', 'Load', 'MX', 'cleared', 0, 1000, '{}', '', '{}',
+                      now() - interval '40 days'
+               FROM generate_series(1, %s) g""",
+            (HISTORY,),
+        )
+        conn.execute("ANALYZE authorizations")
 
 
 def run(name: str, card_for: Any) -> None:
@@ -93,3 +114,5 @@ if __name__ == "__main__":
     seed()
     run("hot", lambda i: "lt_card_0")
     run("spread", lambda i: f"lt_card_{i % COMPANIES}")
+    add_history()
+    run("history", lambda i: "lt_card_0")
