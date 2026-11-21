@@ -61,6 +61,10 @@ def add_history() -> None:
                FROM generate_series(1, %s) g""",
             (HISTORY,),
         )
+        # Keep the posted counter true to the rows (ADR 0004), as a backfill would.
+        conn.execute(
+            "UPDATE companies SET posted = posted + 1000 * %s WHERE id = 'lt_co_0'", (HISTORY,)
+        )
         conn.execute("ANALYZE authorizations")
 
 

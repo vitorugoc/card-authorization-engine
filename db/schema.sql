@@ -3,6 +3,9 @@ CREATE TABLE companies (
   name          text NOT NULL,
   currency      char(3) NOT NULL,
   credit_limit  bigint NOT NULL CHECK (credit_limit >= 0),
+  -- Running total of settled spend, written only by clearings under this row's lock
+  -- (ADR 0004). Summing history instead costs O(all clearings ever) per authorization.
+  posted        bigint NOT NULL DEFAULT 0 CHECK (posted >= 0),
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 
@@ -42,7 +45,9 @@ CREATE TABLE authorizations (
   CHECK (status = 'pending' OR held_amount = 0),
   CHECK (cleared_amount = 0 OR status = 'cleared')
 );
-CREATE INDEX authorizations_company_open ON authorizations (company_id) WHERE status IN ('pending','cleared');
+-- Holds are the small, live working set: the only thing still summed per decision.
+CREATE INDEX authorizations_company_pending ON authorizations (company_id) INCLUDE (held_amount)
+  WHERE status = 'pending';
 CREATE INDEX authorizations_card_created ON authorizations (card_id, created_at);
 
 CREATE TABLE authorization_events (

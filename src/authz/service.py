@@ -47,30 +47,29 @@ def _one(row: DictRow | None, what: str) -> DictRow:
     return row
 
 
-def _lock_company(conn: Conn, company_id: str) -> DictRow:
-    return _one(
-        conn.execute(
-            "SELECT id, currency, credit_limit FROM companies WHERE id = %s FOR UPDATE",
-            (company_id,),
-        ).fetchone(),
+def _lock_company(conn: Conn, company_id: str) -> None:
+    _one(
+        conn.execute("SELECT 1 FROM companies WHERE id = %s FOR UPDATE", (company_id,)).fetchone(),
         "company row",
     )
 
 
-def _company_state(conn: Conn, company: DictRow) -> CompanyState:
-    totals = conn.execute(
-        """SELECT COALESCE(SUM(held_amount), 0)::bigint    AS held,
-                  COALESCE(SUM(cleared_amount), 0)::bigint AS posted
-           FROM authorizations
-           WHERE company_id = %s AND status IN ('pending', 'cleared')""",
-        (company["id"],),
+def _company_state(conn: Conn, company_id: str) -> CompanyState:
+    """posted is a running counter (ADR 0004); only open holds are summed, and they are few."""
+    row = conn.execute(
+        """SELECT c.currency, c.credit_limit, c.posted,
+                  (SELECT COALESCE(SUM(a.held_amount), 0)::bigint
+                   FROM authorizations a
+                   WHERE a.company_id = c.id AND a.status = 'pending') AS held
+           FROM companies c WHERE c.id = %s""",
+        (company_id,),
     ).fetchone()
-    totals = _one(totals, "company totals")
+    row = _one(row, "company row")
     return CompanyState(
-        currency=company["currency"],
-        credit_limit=company["credit_limit"],
-        held=totals["held"],
-        posted=totals["posted"],
+        currency=row["currency"],
+        credit_limit=row["credit_limit"],
+        held=row["held"],
+        posted=row["posted"],
     )
 
 
@@ -204,14 +203,14 @@ def _authorize(req: AuthorizationRequest, req_hash: str) -> tuple[dict[str, Any]
             response = _response(None, req, "declined", "card_not_found", ["card_not_found"], None)
             return response, False
 
-        locked = _lock_company(conn, card["company_id"])
+        _lock_company(conn, card["company_id"])
         # Lookup AFTER the lock: concurrent duplicates serialize and the second sees the first.
         stored = _stored_response(
             conn, "authorization", req.network_transaction_id, _same_hash(req_hash)
         )
         if stored is not None:
             return stored, True
-        company = _company_state(conn, locked)
+        company = _company_state(conn, card["company_id"])
         # Re-read the card under the lock: a concurrent freeze/limit change can't race us.
         card_state = _card_state(conn, req.card_id)
         decision = evaluate(req.amount, req.currency, req.mcc, card_state, company)
@@ -301,7 +300,8 @@ def _apply_event_tx(ntid: str, type_: str, event_id: str, amount: int | None) ->
         ).fetchone()
         if found is None:
             raise DomainError(404, "authorization_not_found")
-        locked = _lock_company(conn, found["company_id"])
+        company_id = found["company_id"]
+        _lock_company(conn, company_id)
         stored = _stored_response(conn, "event", event_id, _same_event(ntid, type_, amount))
         if stored is not None:
             return stored
@@ -335,6 +335,11 @@ def _apply_event_tx(ntid: str, type_: str, event_id: str, amount: int | None) ->
             " WHERE id = %s",
             (status, new_held, cleared, auth["id"]),
         )
+        if cleared:
+            # Same transaction, same lock as the row above: the counter cannot drift from it.
+            conn.execute(
+                "UPDATE companies SET posted = posted + %s WHERE id = %s", (cleared, company_id)
+            )
         response = {
             "authorization_id": auth["id"],
             "network_transaction_id": ntid,
@@ -344,7 +349,7 @@ def _apply_event_tx(ntid: str, type_: str, event_id: str, amount: int | None) ->
             "status": status,
             "held_amount": new_held,
             "cleared_amount": cleared,
-            "available_credit_after": available(_company_state(conn, locked)),
+            "available_credit_after": available(_company_state(conn, company_id)),
         }
         conn.execute(
             """INSERT INTO authorization_events
@@ -392,17 +397,17 @@ def update_card(card_id: str, patch: CardPatch) -> dict[str, Any]:
 
 def get_company(company_id: str) -> dict[str, Any]:
     with pool().connection() as conn:
-        row = conn.execute(
-            "SELECT id, name, currency, credit_limit FROM companies WHERE id = %s", (company_id,)
-        ).fetchone()
+        row = conn.execute("SELECT id, name FROM companies WHERE id = %s", (company_id,)).fetchone()
         if row is None:
             raise DomainError(404, "company_not_found")
-        state = _company_state(conn, row)
+        state = _company_state(conn, company_id)
     return {
         **row,
+        "currency": state.currency,
+        "credit_limit": state.credit_limit,
         "held": state.held,
         "posted": state.posted,
-        "available": state.credit_limit - state.held - state.posted,
+        "available": available(state),
     }
 
 
